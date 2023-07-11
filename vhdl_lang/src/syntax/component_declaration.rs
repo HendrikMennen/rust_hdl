@@ -4,7 +4,7 @@
 //
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
-use super::common::error_on_end_identifier_mismatch;
+use super::common::check_end_identifier_mismatch;
 use super::common::ParseResult;
 use super::interface_declaration::{parse_generic_interface_list, parse_port_interface_list};
 use super::tokens::{Kind::*, TokenStream};
@@ -13,7 +13,7 @@ use crate::ast::{ComponentDeclaration, InterfaceDeclaration};
 use crate::data::{Diagnostic, DiagnosticHandler};
 
 pub fn parse_optional_generic_list(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<Option<Vec<InterfaceDeclaration>>> {
     let mut list = None;
@@ -21,7 +21,7 @@ pub fn parse_optional_generic_list(
         let token = stream.peek_expect()?;
         match token.kind {
             Generic => {
-                stream.move_after(&token);
+                stream.skip();
                 let new_list = parse_generic_interface_list(stream, diagnostics)?;
                 stream.expect_kind(SemiColon)?;
                 if list.is_some() {
@@ -38,7 +38,7 @@ pub fn parse_optional_generic_list(
 }
 
 pub fn parse_optional_port_list(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<Option<Vec<InterfaceDeclaration>>> {
     let mut list = None;
@@ -46,7 +46,7 @@ pub fn parse_optional_port_list(
         let token = stream.peek_expect()?;
         match token.kind {
             Port => {
-                stream.move_after(&token);
+                stream.skip();
                 let new_list = parse_port_interface_list(stream, diagnostics)?;
                 stream.expect_kind(SemiColon)?;
                 if list.is_some() {
@@ -56,7 +56,7 @@ pub fn parse_optional_port_list(
                 }
             }
             Generic => {
-                stream.move_after(&token);
+                stream.skip();
                 parse_generic_interface_list(stream, diagnostics)?;
                 stream.expect_kind(SemiColon)?;
                 diagnostics.push(Diagnostic::error(
@@ -72,26 +72,22 @@ pub fn parse_optional_port_list(
 }
 
 pub fn parse_component_declaration(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<ComponentDeclaration> {
     stream.expect_kind(Component)?;
     let ident = WithDecl::new(stream.expect_ident()?);
-    stream.pop_if_kind(Is)?;
+    stream.pop_if_kind(Is);
 
     let generic_list = parse_optional_generic_list(stream, diagnostics)?;
     let port_list = parse_optional_port_list(stream, diagnostics)?;
     stream.expect_kind(End)?;
     stream.expect_kind(Component)?;
-    if let Some(token) = stream.pop_if_kind(Identifier)? {
-        diagnostics.push_some(error_on_end_identifier_mismatch(
-            &ident.tree,
-            &Some(token.expect_ident()?),
-        ));
-    }
+    let end_ident = stream.pop_optional_ident();
     stream.expect_kind(SemiColon)?;
 
     Ok(ComponentDeclaration {
+        end_ident_pos: check_end_identifier_mismatch(&ident.tree, end_ident, diagnostics),
         ident,
         generic_list: generic_list.unwrap_or_default(),
         port_list: port_list.unwrap_or_default(),
@@ -104,16 +100,19 @@ mod tests {
 
     use crate::ast::Ident;
     use crate::syntax::test::Code;
+    use crate::SrcPos;
 
     fn to_component(
         ident: WithDecl<Ident>,
         generic_list: Vec<InterfaceDeclaration>,
         port_list: Vec<InterfaceDeclaration>,
+        end_ident_pos: Option<SrcPos>,
     ) -> ComponentDeclaration {
         ComponentDeclaration {
             ident,
             generic_list,
             port_list,
+            end_ident_pos,
         }
     }
 
@@ -128,7 +127,7 @@ end component;
         let component = code.with_stream_no_diagnostics(parse_component_declaration);
         assert_eq!(
             component,
-            to_component(code.s1("foo").decl_ident(), vec![], vec![])
+            to_component(code.s1("foo").decl_ident(), vec![], vec![], None)
         );
 
         let code = Code::new(
@@ -140,7 +139,7 @@ end component;
         let component = code.with_stream_no_diagnostics(parse_component_declaration);
         assert_eq!(
             component,
-            to_component(code.s1("foo").decl_ident(), vec![], vec![])
+            to_component(code.s1("foo").decl_ident(), vec![], vec![], None)
         );
 
         let code = Code::new(
@@ -152,7 +151,12 @@ end component foo;
         let component = code.with_stream_no_diagnostics(parse_component_declaration);
         assert_eq!(
             component,
-            to_component(code.s1("foo").decl_ident(), vec![], vec![])
+            to_component(
+                code.s1("foo").decl_ident(),
+                vec![],
+                vec![],
+                Some(code.s("foo", 2).pos())
+            )
         );
     }
 
@@ -173,7 +177,8 @@ end component;
             to_component(
                 code.s1("foo").decl_ident(),
                 vec![code.s1("foo : natural").generic()],
-                vec![]
+                vec![],
+                None
             )
         );
     }
@@ -195,7 +200,8 @@ end component;
             to_component(
                 code.s1("foo").decl_ident(),
                 vec![],
-                vec![code.s1("foo : natural").port()]
+                vec![code.s1("foo : natural").port()],
+                None
             )
         );
     }

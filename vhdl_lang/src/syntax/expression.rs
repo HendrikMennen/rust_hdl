@@ -5,12 +5,12 @@
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
 use super::common::ParseResult;
-use super::names::{parse_name_initial_token, parse_type_mark};
+use super::names::{parse_name, parse_type_mark};
 use super::subtype_indication::parse_subtype_constraint;
-use super::tokens::{Kind, Kind::*, Token, TokenStream};
+use super::tokens::{Kind, Kind::*, TokenStream};
 use crate::ast;
 use crate::ast::*;
-use crate::data::{Diagnostic, Symbol, WithPos};
+use crate::data::{Diagnostic, WithPos};
 
 fn name_to_expression(name: WithPos<Name>) -> WithPos<Expression> {
     WithPos {
@@ -142,40 +142,45 @@ fn kind_to_binary_op(kind: Kind) -> Option<(Operator, usize)> {
 }
 
 pub fn parse_aggregate_initial_choices(
-    stream: &mut TokenStream,
-    choices: Vec<Choice>,
+    stream: &TokenStream,
+    choices: Vec<WithPos<Choice>>,
 ) -> ParseResult<WithPos<Vec<ElementAssociation>>> {
     let mut choices = choices;
     let mut result = Vec::new();
     loop {
-        let token = stream.expect()?;
-        try_token_kind!(
+        expect_token!(
+            stream,
             token,
             RightPar => {
-                if let [Choice::Expression(ref choice)] = *choices.as_slice() {
-                    result.push(ElementAssociation::Positional(choice.clone()));
-                    return Ok(WithPos::from(result, token))
-                } else {
-                    return Err(Diagnostic::error(&token, "Expected => after others"));
+                if choices.len() == 1 {
+                    if let Some(WithPos{item: Choice::Expression(expr), pos}) = choices.pop() {
+                        result.push(ElementAssociation::Positional(WithPos::new(expr, pos)));
+                        return Ok(WithPos::from(result, token.pos.clone()))
+                    }
                 }
+
+                return Err(token.kinds_error(&[RightArrow]));
             },
             Comma => {
-                if let [Choice::Expression(ref choice)] = *choices.as_slice() {
-                    result.push(ElementAssociation::Positional(choice.clone()));
-                } else {
-                    return Err(Diagnostic::error(&token, "Expected => after others"));
+                if choices.len() == 1 {
+                    if let Some(WithPos{item: Choice::Expression(expr), pos}) = choices.pop() {
+                        result.push(ElementAssociation::Positional(WithPos::new(expr, pos)));
+                        choices = parse_choices(stream)?;
+                        continue;
+                    }
                 }
-                choices = parse_choices(stream)?;
+
+                return Err(token.kinds_error(&[RightArrow]));
             },
             RightArrow => {
                 let rhs = parse_expression(stream)?;
                 result.push(ElementAssociation::Named(choices, rhs));
 
-                let token = stream.expect()?;
-                try_token_kind!(
+                expect_token!(
+                    stream,
                     token,
                     RightPar => {
-                        return Ok(WithPos::from(result, token))
+                        return Ok(WithPos::from(result, token.pos.clone()))
                     },
                     Comma => {
                         choices = parse_choices(stream)?;
@@ -186,59 +191,55 @@ pub fn parse_aggregate_initial_choices(
     }
 }
 
-#[cfg(test)]
-pub fn parse_aggregate(stream: &mut TokenStream) -> ParseResult<WithPos<Vec<ElementAssociation>>> {
+pub fn parse_aggregate(stream: &TokenStream) -> ParseResult<WithPos<Vec<ElementAssociation>>> {
     stream.expect_kind(LeftPar)?;
-    parse_aggregate_leftpar_known(stream)
-}
-
-pub fn parse_aggregate_leftpar_known(
-    stream: &mut TokenStream,
-) -> ParseResult<WithPos<Vec<ElementAssociation>>> {
-    if let Some(token) = stream.pop_if_kind(RightPar)? {
-        return Ok(WithPos::from(Vec::new(), token));
+    if let Some(token) = stream.pop_if_kind(RightPar) {
+        return Ok(WithPos::from(Vec::new(), token.pos.clone()));
     };
     let choices = parse_choices(stream)?;
     parse_aggregate_initial_choices(stream, choices)
 }
 
 fn parse_half_range(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     left_expr: WithPos<Expression>,
     direction: Direction,
-) -> ParseResult<DiscreteRange> {
+) -> ParseResult<WithPos<DiscreteRange>> {
     let right_expr = parse_expression(stream)?;
+    let pos = left_expr.pos.combine(&right_expr.pos);
+
     let range = DiscreteRange::Range(ast::Range::Range(RangeConstraint {
         direction,
         left_expr: Box::new(left_expr),
         right_expr: Box::new(right_expr),
     }));
-    Ok(range)
+
+    Ok(WithPos::new(range, pos))
 }
 
-fn parse_choice(stream: &mut TokenStream) -> ParseResult<Choice> {
-    if stream.skip_if_kind(Others)? {
-        return Ok(Choice::Others);
+fn parse_choice(stream: &TokenStream) -> ParseResult<WithPos<Choice>> {
+    if let Some(token) = stream.pop_if_kind(Others) {
+        return Ok(WithPos::new(Choice::Others, token.pos.clone()));
     }
     let left_expr = parse_expression(stream)?;
 
-    if stream.skip_if_kind(To)? {
+    if stream.skip_if_kind(To) {
         let range = parse_half_range(stream, left_expr, Direction::Ascending)?;
-        Ok(Choice::DiscreteRange(range))
-    } else if stream.skip_if_kind(Downto)? {
+        Ok(range.map_into(Choice::DiscreteRange))
+    } else if stream.skip_if_kind(Downto) {
         let range = parse_half_range(stream, left_expr, Direction::Descending)?;
-        Ok(Choice::DiscreteRange(range))
+        Ok(range.map_into(Choice::DiscreteRange))
     } else {
-        Ok(Choice::Expression(left_expr))
+        Ok(left_expr.map_into(Choice::Expression))
     }
 }
 
-pub fn parse_choices(stream: &mut TokenStream) -> ParseResult<Vec<Choice>> {
+pub fn parse_choices(stream: &TokenStream) -> ParseResult<Vec<WithPos<Choice>>> {
     let mut choices = Vec::new();
     loop {
         choices.push(parse_choice(stream)?);
 
-        if !stream.skip_if_kind(Bar)? {
+        if !stream.skip_if_kind(Bar) {
             break;
         }
     }
@@ -246,10 +247,11 @@ pub fn parse_choices(stream: &mut TokenStream) -> ParseResult<Vec<Choice>> {
 }
 
 /// LRM 9.3.7 Allocators
-fn parse_allocator(stream: &mut TokenStream) -> ParseResult<WithPos<Allocator>> {
+fn parse_allocator(stream: &TokenStream) -> ParseResult<WithPos<Allocator>> {
+    stream.expect_kind(New)?;
     let type_mark = parse_type_mark(stream)?;
 
-    if stream.skip_if_kind(Tick)? {
+    if stream.skip_if_kind(Tick) {
         let expr = parse_expression(stream)?;
         let pos = type_mark.pos.clone().combine_into(&expr);
         Ok(WithPos {
@@ -281,16 +283,15 @@ fn parse_allocator(stream: &mut TokenStream) -> ParseResult<WithPos<Allocator>> 
     }
 }
 
-fn name_to_type_mark(name: WithPos<Name>, subtype_sym: &Symbol) -> ParseResult<WithPos<TypeMark>> {
+pub fn name_to_type_mark(name: WithPos<Name>) -> ParseResult<WithPos<TypeMark>> {
     let pos = name.pos.clone();
     let type_mark = name
         .try_map_into(|name| match name {
             Name::Attribute(attr) => {
-                if attr.signature.is_none() && attr.expr.is_none() && attr.attr.item == *subtype_sym
-                {
+                if let Some(typattr) = attr.as_type() {
                     Some(TypeMark {
                         name: attr.name.try_map_into(name_to_selected_name)?,
-                        subtype: true,
+                        attr: Some(typattr),
                     })
                 } else {
                     None
@@ -298,7 +299,7 @@ fn name_to_type_mark(name: WithPos<Name>, subtype_sym: &Symbol) -> ParseResult<W
             }
             _ => Some(TypeMark {
                 name: WithPos::from(name_to_selected_name(name)?, pos.clone()),
-                subtype: false,
+                attr: None,
             }),
         })
         .ok_or_else(|| Diagnostic::error(&pos, "Expected type mark"))?;
@@ -317,39 +318,50 @@ fn name_to_selected_name(name: Name) -> Option<SelectedName> {
     }
 }
 
-fn parse_expression_or_aggregate(stream: &mut TokenStream) -> ParseResult<WithPos<Expression>> {
-    let choices = parse_choices(stream)?;
-    // Parenthesized expression or aggregate
-    match *choices.as_slice() {
-        // Can be aggregate or expression
-        [Choice::Expression(ref expr)] => {
-            let sep_token = stream.peek_expect()?;
-            match_token_kind!(
-                sep_token,
+fn parse_expression_or_aggregate(stream: &TokenStream) -> ParseResult<WithPos<Expression>> {
+    let mut choices = parse_choices(stream)?;
 
-                // Was aggregate
-                Comma | RightArrow => {
-                    Ok(parse_aggregate_initial_choices(
-                        stream,
-                        vec![Choice::Expression(expr.clone())],
-                    )?.map_into(Expression::Aggregate))
-                },
+    if choices.len() == 1
+        && matches!(
+            choices.first().unwrap(),
+            WithPos {
+                item: Choice::Expression(_),
+                ..
+            }
+        )
+    {
+        let WithPos {
+            item: Choice::Expression(expr),
+            pos
+        } = choices.pop().unwrap() else {
+            unreachable!();
+        };
 
-                // Was expression with parenthesis
-                RightPar => {
-                    let rpar_token = stream.expect()?;
-                    // Lexical position between parenthesis
-                    let expr = WithPos {
-                        item: expr.item.clone(),
-                        pos: rpar_token.pos,
-                    };
-                    Ok(expr)
-                }
-            )
-        }
+        peek_token!(
+            stream, token,
+
+            // Was aggregate
+            Comma | RightArrow => {
+                Ok(parse_aggregate_initial_choices(
+                    stream,
+                    vec![WithPos::new(Choice::Expression(expr), pos)],
+                )?.map_into(Expression::Aggregate))
+            },
+
+            // Was expression with parenthesis
+            RightPar => {
+                stream.skip();
+                // Lexical position between parenthesis
+                let expr = WithPos {
+                    item: expr,
+                    pos: token.pos.clone(),
+                };
+                Ok(expr)
+            }
+        )
+    } else {
         // Must be aggregate
-        _ => Ok(parse_aggregate_initial_choices(stream, choices.clone())?
-            .map_into(Expression::Aggregate)),
+        Ok(parse_aggregate_initial_choices(stream, choices)?.map_into(Expression::Aggregate))
     }
 }
 
@@ -357,20 +369,18 @@ fn parse_expression_or_aggregate(stream: &mut TokenStream) -> ParseResult<WithPo
 /// 1. CHARACTER_LITERAL|INTEGER_LITERAL|IDENTIFIER|BOOLEAN_LITERAL
 /// 2. (expression)
 /// 3. PREFIX_UNARY_OP expression
-fn parse_primary_initial_token(
-    stream: &mut TokenStream,
-    token: Token,
-) -> ParseResult<WithPos<Expression>> {
+fn parse_primary(stream: &TokenStream) -> ParseResult<WithPos<Expression>> {
+    let token = stream.peek_expect()?;
     match token.kind {
         Identifier | LtLt => {
-            let name = parse_name_initial_token(stream, token)?;
-            if stream.skip_if_kind(Tick)? {
+            let name = parse_name(stream)?;
+            if stream.skip_if_kind(Tick) {
                 let lpar = stream.expect_kind(LeftPar)?;
                 let expr = parse_expression_or_aggregate(stream)?.combine_pos_with(&lpar);
                 let pos = name.pos.combine(&expr);
                 Ok(WithPos {
                     item: Expression::Qualified(Box::new(QualifiedExpression {
-                        type_mark: name_to_type_mark(name, stream.subtype_sym())?,
+                        type_mark: name_to_type_mark(name)?,
                         expr,
                     })),
                     pos,
@@ -379,41 +389,52 @@ fn parse_primary_initial_token(
                 Ok(name_to_expression(name))
             }
         }
-        BitString => Ok(token
-            .expect_bit_string()?
-            .map_into(|bs| Expression::Literal(Literal::BitString(bs)))),
-        Character => Ok(token
-            .expect_character()?
-            .map_into(|chr| Expression::Literal(Literal::Character(chr)))),
+        BitString => {
+            stream.skip();
+            Ok(token
+                .to_bit_string()?
+                .map_into(|bs| Expression::Literal(Literal::BitString(bs))))
+        }
+        Character => {
+            stream.skip();
+            Ok(token
+                .to_character_value()?
+                .map_into(|chr| Expression::Literal(Literal::Character(chr))))
+        }
         StringLiteral => {
-            if stream.peek_kind()? == Some(LeftPar) {
+            if stream.next_kinds_are(&[StringLiteral, LeftPar]) {
                 // Probably an function call via operator symbol "foo"()
-                parse_name_initial_token(stream, token)
+                parse_name(stream)
                     .map(|name| name.map_into(|name| Expression::Name(Box::new(name))))
             } else {
+                stream.skip();
                 Ok(token
-                    .expect_string()?
+                    .to_string_value()?
                     .map_into(|string| Expression::Literal(Literal::String(string))))
             }
         }
-        Null => Ok(WithPos {
-            item: Expression::Literal(Literal::Null),
-            pos: token.pos,
-        }),
+        Null => {
+            stream.skip();
+            Ok(WithPos {
+                item: Expression::Literal(Literal::Null),
+                pos: token.pos.clone(),
+            })
+        }
         New => {
             let alloc = parse_allocator(stream)?;
 
-            let new_pos = token.pos.combine_into(&alloc);
+            let new_pos = token.pos.combine(&alloc);
             Ok(WithPos {
                 item: Expression::New(Box::new(alloc)),
                 pos: new_pos,
             })
         }
         AbstractLiteral => {
-            let value = token.expect_abstract_literal()?;
+            stream.skip();
+            let value = token.to_abstract_literal()?;
             // Physical unit
-            if let Some(unit_token) = stream.pop_if_kind(Identifier)? {
-                let unit = unit_token.expect_ident()?;
+            if let Some(unit_token) = stream.pop_if_kind(Identifier) {
+                let unit = unit_token.to_identifier_value()?;
                 let pos = value.pos.combine_into(&unit);
                 let physical = PhysicalLiteral {
                     value: value.item,
@@ -428,40 +449,39 @@ fn parse_primary_initial_token(
             }
         }
 
-        LeftPar => parse_expression_or_aggregate(stream).map(|expr| expr.combine_pos_with(&token)),
+        LeftPar => {
+            stream.skip();
+            parse_expression_or_aggregate(stream).map(|expr| expr.combine_pos_with(&token))
+        }
 
         kind => {
             // Prefix unary operation
             if let Some((unary_op, op_precedence)) = kind_to_prefix_unary_op(kind) {
+                stream.skip();
+
                 let expr = parse_expr(stream, op_precedence)?;
                 let pos = token.pos.combine(&expr);
 
                 Ok(WithPos {
                     item: Expression::Unary(
-                        WithPos::new(WithRef::new(unary_op), token.pos),
+                        WithPos::new(WithRef::new(unary_op), token.pos.clone()),
                         Box::new(expr),
                     ),
                     pos,
                 })
             } else {
-                Err(Diagnostic::error(&token, "Expected {expression}"))
+                Err(Diagnostic::error(
+                    stream.pos_before(token),
+                    "Expected {expression}",
+                ))
             }
         }
     }
 }
 
-fn parse_expr(stream: &mut TokenStream, min_precedence: usize) -> ParseResult<WithPos<Expression>> {
-    let token = stream.expect()?;
-    parse_expr_initial_token(stream, token, min_precedence)
-}
-
-fn parse_expr_initial_token(
-    stream: &mut TokenStream,
-    token: Token,
-    min_precedence: usize,
-) -> ParseResult<WithPos<Expression>> {
-    let mut lhs = parse_primary_initial_token(stream, token)?;
-    while let Some(token) = stream.peek()? {
+fn parse_expr(stream: &TokenStream, min_precedence: usize) -> ParseResult<WithPos<Expression>> {
+    let mut lhs = parse_primary(stream)?;
+    while let Some(token) = stream.peek() {
         if token.kind == RightPar {
             return Ok(lhs);
         };
@@ -469,12 +489,12 @@ fn parse_expr_initial_token(
         if let Some((binary_op, op_precedence)) = kind_to_binary_op(token.kind) {
             // Binary operation
             if op_precedence > min_precedence {
-                stream.move_after(&token);
+                stream.skip();
                 let rhs = parse_expr(stream, op_precedence)?;
                 let pos = lhs.pos.combine(&rhs);
                 lhs = WithPos {
                     item: Expression::Binary(
-                        WithPos::new(WithRef::new(binary_op), token.pos),
+                        WithPos::new(WithRef::new(binary_op), token.pos.clone()),
                         Box::new(lhs),
                         Box::new(rhs),
                     ),
@@ -504,16 +524,12 @@ fn parse_expr_initial_token(
 ///   6. sign: + | -
 ///   7. multiplying_operator: * | / | mod | rem
 ///   8. misc_operator: ** | abs | not
-pub fn parse_expression(stream: &mut TokenStream) -> ParseResult<WithPos<Expression>> {
-    let token = stream.expect()?;
-    parse_expression_initial_token(stream, token)
-}
-
-pub fn parse_expression_initial_token(
-    stream: &mut TokenStream,
-    token: Token,
-) -> ParseResult<WithPos<Expression>> {
-    parse_expr_initial_token(stream, token, 0)
+pub fn parse_expression(stream: &TokenStream) -> ParseResult<WithPos<Expression>> {
+    let state = stream.state();
+    parse_expr(stream, 0).map_err(|err| {
+        stream.set_state(state);
+        err
+    })
 }
 
 #[cfg(test)]
@@ -945,7 +961,7 @@ mod tests {
         };
 
         let assoc_list = vec![ElementAssociation::Named(
-            vec![Choice::Expression(one_expr)],
+            vec![one_expr.map_into(Choice::Expression)],
             two_expr,
         )];
         let expr = WithPos {
@@ -975,7 +991,10 @@ mod tests {
         };
 
         let assoc_list = vec![ElementAssociation::Named(
-            vec![Choice::Expression(one_expr), Choice::Expression(two_expr)],
+            vec![
+                one_expr.map_into(Choice::Expression),
+                two_expr.map_into(Choice::Expression),
+            ],
             three_expr,
         )];
         let expr = WithPos {
@@ -994,7 +1013,10 @@ mod tests {
             pos: code.s1("1").pos(),
         };
 
-        let assoc_list = vec![ElementAssociation::Named(vec![Choice::Others], one_expr)];
+        let assoc_list = vec![ElementAssociation::Named(
+            vec![WithPos::new(Choice::Others, code.s1("others"))],
+            one_expr,
+        )];
         let expr = WithPos {
             item: Expression::Aggregate(assoc_list),
             pos: code.pos(),
@@ -1006,11 +1028,13 @@ mod tests {
     #[test]
     fn parses_aggregate_range() {
         for direction in [Direction::Descending, Direction::Ascending].iter() {
-            let code = {
+            let (pos, code) = {
                 if *direction == Direction::Descending {
-                    Code::new("(1 downto 0 => 2)")
+                    let code = Code::new("(1 downto 0 => 2)");
+                    (code.s1("1 downto 0").pos(), code)
                 } else {
-                    Code::new("(1 to 0 => 2)")
+                    let code = Code::new("(1 to 0 => 2)");
+                    (code.s1("1 to 0").pos(), code)
                 }
             };
 
@@ -1036,7 +1060,7 @@ mod tests {
             }));
 
             let assoc_list = vec![ElementAssociation::Named(
-                vec![Choice::DiscreteRange(range)],
+                vec![WithPos::new(Choice::DiscreteRange(range), pos)],
                 two_expr,
             )];
             let expr = WithPos {
@@ -1062,8 +1086,14 @@ mod tests {
         };
 
         let assoc_list = vec![
-            ElementAssociation::Named(vec![Choice::Others], one_expr),
-            ElementAssociation::Named(vec![Choice::Others], two_expr),
+            ElementAssociation::Named(
+                vec![WithPos::new(Choice::Others, code.s("others", 1))],
+                one_expr,
+            ),
+            ElementAssociation::Named(
+                vec![WithPos::new(Choice::Others, code.s("others", 2))],
+                two_expr,
+            ),
         ];
         let expr = WithPos {
             item: Expression::Aggregate(assoc_list),
@@ -1090,7 +1120,7 @@ mod tests {
         };
 
         let assoc_list = vec![
-            ElementAssociation::Named(vec![Choice::Expression(one_expr)], two_expr),
+            ElementAssociation::Named(vec![one_expr.map_into(Choice::Expression)], two_expr),
             ElementAssociation::Positional(three_expr),
         ];
         let expr = WithPos {
@@ -1205,8 +1235,8 @@ mod tests {
                 // @TODO quote and escape
                 Literal::String(val) => val.to_string(),
                 Literal::AbstractLiteral(val) => match val {
-                    AbstractLiteral::Integer(val) => format!("Integer({})", val),
-                    AbstractLiteral::Real(val) => format!("Real({})", val),
+                    AbstractLiteral::Integer(val) => format!("Integer({val})"),
+                    AbstractLiteral::Real(val) => format!("Real({val})"),
                 },
                 Literal::Character(val) => format!("'{}'", Latin1String::new(&[*val])),
                 Literal::Physical(ref physical) => match physical.value {
@@ -1219,12 +1249,12 @@ mod tests {
                 },
                 _ => {
                     println!("{}", expr.pos.code_context());
-                    panic!("Cannot format {:?}", lit);
+                    panic!("Cannot format {lit:?}");
                 }
             },
             _ => {
                 println!("{}", expr.pos.code_context());
-                panic!("Cannot format {:?}", expr);
+                panic!("Cannot format {expr:?}");
             }
         }
     }

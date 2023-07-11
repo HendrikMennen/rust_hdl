@@ -7,6 +7,7 @@
 // These fields are better explicit than .. since we are forced to consider if new fields should be searched
 #![allow(clippy::unneeded_field_pattern)]
 
+use super::named_entity::*;
 use super::*;
 use crate::ast::*;
 use crate::data::*;
@@ -17,12 +18,52 @@ use target::AssignmentType;
 impl<'a> AnalyzeContext<'a> {
     pub fn analyze_concurrent_part(
         &self,
-        parent: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         statements: &mut [LabeledConcurrentStatement],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         for statement in statements.iter_mut() {
-            self.analyze_concurrent_statement(parent, statement, diagnostics)?;
+            let parent = if let Some(id) = statement.label.decl {
+                self.arena.get(id)
+            } else {
+                parent
+            };
+
+            self.analyze_concurrent_statement(scope, parent, statement, diagnostics)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn define_labels_for_concurrent_part(
+        &self,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
+        statements: &mut [LabeledConcurrentStatement],
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) -> FatalResult {
+        for statement in statements.iter_mut() {
+            if let Some(ref mut label) = statement.label.tree {
+                let ent = self.arena.explicit(
+                    label.name(),
+                    parent,
+                    AnyEntKind::Concurrent(statement.statement.item.label_typ()),
+                    Some(label.pos()),
+                );
+                statement.label.decl = Some(ent.id());
+                scope.add(ent, diagnostics);
+            } else if statement.statement.item.can_have_label() {
+                // Generate an anonymous label if it is not explicitly defined
+                let ent = self.arena.alloc(
+                    Designator::Anonymous(scope.next_anonymous()),
+                    Some(parent),
+                    Related::None,
+                    AnyEntKind::Concurrent(statement.statement.item.label_typ()),
+                    None,
+                );
+                statement.label.decl = Some(ent.id());
+            }
         }
 
         Ok(())
@@ -30,34 +71,38 @@ impl<'a> AnalyzeContext<'a> {
 
     fn analyze_concurrent_statement(
         &self,
-        parent: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         statement: &mut LabeledConcurrentStatement,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        if let Some(ref mut label) = statement.label {
-            parent.add(label.define(NamedEntityKind::Label), diagnostics);
-        }
-
-        match statement.statement {
+    ) -> FatalResult {
+        match statement.statement.item {
             ConcurrentStatement::Block(ref mut block) => {
                 if let Some(ref mut guard_condition) = block.guard_condition {
-                    self.analyze_expression(parent, guard_condition, diagnostics)?;
+                    self.boolean_expr(scope, guard_condition, diagnostics)?;
                 }
-                let mut region = parent.nested();
+                let nested = scope.nested();
                 if let Some(ref mut list) = block.header.generic_clause {
-                    self.analyze_interface_list(&mut region, list, diagnostics)?;
+                    self.analyze_interface_list(&nested, parent, list, diagnostics)?;
                 }
                 if let Some(ref mut list) = block.header.generic_map {
-                    self.analyze_assoc_elems(parent, list, diagnostics)?;
+                    self.analyze_assoc_elems(scope, list, diagnostics)?;
                 }
                 if let Some(ref mut list) = block.header.port_clause {
-                    self.analyze_interface_list(&mut region, list, diagnostics)?;
+                    self.analyze_interface_list(&nested, parent, list, diagnostics)?;
                 }
                 if let Some(ref mut list) = block.header.port_map {
-                    self.analyze_assoc_elems(parent, list, diagnostics)?;
+                    self.analyze_assoc_elems(scope, list, diagnostics)?;
                 }
-                self.analyze_declarative_part(&mut region, &mut block.decl, diagnostics)?;
-                self.analyze_concurrent_part(&mut region, &mut block.statements, diagnostics)?;
+
+                self.define_labels_for_concurrent_part(
+                    scope,
+                    parent,
+                    &mut block.statements,
+                    diagnostics,
+                )?;
+                self.analyze_declarative_part(&nested, parent, &mut block.decl, diagnostics)?;
+                self.analyze_concurrent_part(&nested, parent, &mut block.statements, diagnostics)?;
             }
             ConcurrentStatement::Process(ref mut process) => {
                 let ProcessStatement {
@@ -65,65 +110,71 @@ impl<'a> AnalyzeContext<'a> {
                     sensitivity_list,
                     decl,
                     statements,
+                    end_label_pos: _,
                 } = process;
                 if let Some(sensitivity_list) = sensitivity_list {
                     match sensitivity_list {
                         SensitivityList::Names(names) => {
-                            for name in names.iter_mut() {
-                                self.resolve_name(parent, &name.pos, &mut name.item, diagnostics)?;
-                            }
+                            self.sensitivity_list_check(scope, names, diagnostics)?;
                         }
                         SensitivityList::All => {}
                     }
                 }
-                let mut region = parent.nested();
-                self.analyze_declarative_part(&mut region, decl, diagnostics)?;
-                self.analyze_sequential_part(&mut region, statements, diagnostics)?;
+                let nested = scope.nested();
+                self.define_labels_for_sequential_part(scope, parent, statements, diagnostics)?;
+                self.analyze_declarative_part(&nested, parent, decl, diagnostics)?;
+                self.analyze_sequential_part(&nested, parent, statements, diagnostics)?;
             }
             ConcurrentStatement::ForGenerate(ref mut gen) => {
                 let ForGenerateStatement {
                     index_name,
                     discrete_range,
                     body,
+                    end_label_pos: _,
                 } = gen;
-                self.analyze_discrete_range(parent, discrete_range, diagnostics)?;
-                let mut region = parent.nested();
-                region.add(
-                    index_name.define(NamedEntityKind::LoopParameter),
+                let typ = as_fatal(self.drange_type(scope, discrete_range, diagnostics))?;
+                let nested = scope.nested();
+                nested.add(
+                    index_name.define(self.arena, parent, AnyEntKind::LoopParameter(typ)),
                     diagnostics,
                 );
-                self.analyze_generate_body(&mut region, body, diagnostics)?;
+                self.analyze_generate_body(&nested, parent, body, diagnostics)?;
             }
             ConcurrentStatement::IfGenerate(ref mut gen) => {
                 let Conditionals {
                     conditionals,
                     else_item,
-                } = gen;
+                } = &mut gen.conds;
                 for conditional in conditionals.iter_mut() {
                     let Conditional { condition, item } = conditional;
-                    self.analyze_expression(parent, condition, diagnostics)?;
-                    let mut region = parent.nested();
-                    self.analyze_generate_body(&mut region, item, diagnostics)?;
+                    self.boolean_expr(scope, condition, diagnostics)?;
+                    let nested = scope.nested();
+                    self.analyze_generate_body(&nested, parent, item, diagnostics)?;
                 }
                 if let Some(ref mut else_item) = else_item {
-                    let mut region = parent.nested();
-                    self.analyze_generate_body(&mut region, else_item, diagnostics)?;
+                    let nested = scope.nested();
+                    self.analyze_generate_body(&nested, parent, else_item, diagnostics)?;
                 }
             }
             ConcurrentStatement::CaseGenerate(ref mut gen) => {
-                for alternative in gen.alternatives.iter_mut() {
-                    let mut region = parent.nested();
-                    self.analyze_generate_body(&mut region, &mut alternative.item, diagnostics)?;
+                for alternative in gen.sels.alternatives.iter_mut() {
+                    let nested = scope.nested();
+                    self.analyze_generate_body(
+                        &nested,
+                        parent,
+                        &mut alternative.item,
+                        diagnostics,
+                    )?;
                 }
             }
             ConcurrentStatement::Instance(ref mut instance) => {
-                self.analyze_instance(parent, instance, diagnostics)?;
+                self.analyze_instance(scope, instance, diagnostics)?;
             }
             ConcurrentStatement::Assignment(ref mut assign) => {
                 // @TODO more delaymechanism
                 let ConcurrentSignalAssignment { target, rhs, .. } = assign;
                 self.analyze_waveform_assignment(
-                    parent,
+                    scope,
                     target,
                     AssignmentType::Signal,
                     rhs,
@@ -132,7 +183,7 @@ impl<'a> AnalyzeContext<'a> {
             }
             ConcurrentStatement::ProcedureCall(ref mut pcall) => {
                 let ConcurrentProcedureCall { call, .. } = pcall;
-                self.analyze_procedure_call(parent, call, diagnostics)?;
+                self.analyze_procedure_call(scope, call, diagnostics)?;
             }
             ConcurrentStatement::Assert(ref mut assert) => {
                 let ConcurrentAssertStatement {
@@ -144,12 +195,12 @@ impl<'a> AnalyzeContext<'a> {
                             severity,
                         },
                 } = assert;
-                self.analyze_expression(parent, condition, diagnostics)?;
+                self.boolean_expr(scope, condition, diagnostics)?;
                 if let Some(expr) = report {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.string(), expr, diagnostics)?;
                 }
                 if let Some(expr) = severity {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.severity_level(), expr, diagnostics)?;
                 }
             }
         };
@@ -158,37 +209,50 @@ impl<'a> AnalyzeContext<'a> {
 
     fn analyze_generate_body(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         body: &mut GenerateBody,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         let GenerateBody {
             alternative_label,
             decl,
             statements,
+            end_label_pos: _,
         } = body;
+
+        let mut inner_parent = parent;
         if let Some(label) = alternative_label {
-            region.add(label.define(NamedEntityKind::Label), diagnostics);
+            let ent = label.define(
+                self.arena,
+                parent,
+                AnyEntKind::Concurrent(Some(Concurrent::Generate)),
+            );
+            scope.add(ent, diagnostics);
+            inner_parent = ent;
         }
+
+        // Pre-declare labels
+        self.define_labels_for_concurrent_part(scope, parent, statements, diagnostics)?;
+
         if let Some(ref mut decl) = decl {
-            self.analyze_declarative_part(region, decl, diagnostics)?;
+            self.analyze_declarative_part(scope, parent, decl, diagnostics)?;
         }
-        self.analyze_concurrent_part(region, statements, diagnostics)?;
+        self.analyze_concurrent_part(scope, inner_parent, statements, diagnostics)?;
 
         Ok(())
     }
 
     fn analyze_instance(
         &self,
-        parent: &Region<'_>,
+        scope: &Scope<'a>,
         instance: &mut InstantiationStatement,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         match instance.unit {
-            // @TODO architecture
-            InstantiatedUnit::Entity(ref mut entity_name, ..) => {
+            InstantiatedUnit::Entity(ref mut entity_name, ref mut architecture_name) => {
                 if let Err(err) =
-                    self.resolve_selected_name(parent, entity_name)
+                    self.resolve_selected_name(scope, entity_name)
                         .and_then(|entities| {
                             let expected = "entity";
                             let ent = self.resolve_non_overloaded(
@@ -197,20 +261,40 @@ impl<'a> AnalyzeContext<'a> {
                                 expected,
                             )?;
 
-                            if let NamedEntityKind::Entity(ent_region) = ent.kind() {
+                            if let AnyEntKind::Design(Design::Entity(_, ent_region)) = ent.kind() {
+                                if let Designator::Identifier(entity_ident) = ent.designator() {
+                                    if let Some(library_name) = ent.library_name() {
+                                        if let Some(ref mut architecture_name) = architecture_name {
+                                            match self.get_architecture(
+                                                library_name,
+                                                &architecture_name.item.pos,
+                                                entity_ident,
+                                                &architecture_name.item.item,
+                                            ) {
+                                                Ok(arch) => {
+                                                    architecture_name.set_unique_reference(&arch);
+                                                }
+                                                Err(err) => {
+                                                    diagnostics.push(err.into_non_fatal()?);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let (generic_region, port_region) = ent_region.to_entity_formal();
 
                                 self.analyze_assoc_elems_with_formal_region(
                                     &entity_name.pos,
                                     &generic_region,
-                                    parent,
+                                    scope,
                                     &mut instance.generic_map,
                                     diagnostics,
                                 )?;
                                 self.analyze_assoc_elems_with_formal_region(
                                     &entity_name.pos,
                                     &port_region,
-                                    parent,
+                                    scope,
                                     &mut instance.port_map,
                                     diagnostics,
                                 )?;
@@ -227,7 +311,7 @@ impl<'a> AnalyzeContext<'a> {
             }
             InstantiatedUnit::Component(ref mut component_name) => {
                 if let Err(err) =
-                    self.resolve_selected_name(parent, component_name)
+                    self.resolve_selected_name(scope, component_name)
                         .and_then(|entities| {
                             let expected = "component";
                             let ent = self.resolve_non_overloaded(
@@ -236,19 +320,19 @@ impl<'a> AnalyzeContext<'a> {
                                 expected,
                             )?;
 
-                            if let NamedEntityKind::Component(ent_region) = ent.kind() {
+                            if let AnyEntKind::Component(ent_region) = ent.kind() {
                                 let (generic_region, port_region) = ent_region.to_entity_formal();
                                 self.analyze_assoc_elems_with_formal_region(
                                     &component_name.pos,
                                     &generic_region,
-                                    parent,
+                                    scope,
                                     &mut instance.generic_map,
                                     diagnostics,
                                 )?;
                                 self.analyze_assoc_elems_with_formal_region(
                                     &component_name.pos,
                                     &port_region,
-                                    parent,
+                                    scope,
                                     &mut instance.port_map,
                                     diagnostics,
                                 )?;
@@ -264,12 +348,12 @@ impl<'a> AnalyzeContext<'a> {
                 }
             }
             InstantiatedUnit::Configuration(ref mut config_name) => {
-                fn is_configuration(kind: &NamedEntityKind) -> bool {
-                    matches!(kind, NamedEntityKind::Configuration(..))
+                fn is_configuration(kind: &AnyEntKind) -> bool {
+                    matches!(kind, AnyEntKind::Design(Design::Configuration))
                 }
 
                 if let Err(err) =
-                    self.resolve_selected_name(parent, config_name)
+                    self.resolve_selected_name(scope, config_name)
                         .and_then(|entities| {
                             self.resolve_non_overloaded_with_kind(
                                 entities,
@@ -282,11 +366,48 @@ impl<'a> AnalyzeContext<'a> {
                     err.add_to(diagnostics)?;
                 }
 
-                self.analyze_assoc_elems(parent, &mut instance.generic_map, diagnostics)?;
-                self.analyze_assoc_elems(parent, &mut instance.port_map, diagnostics)?;
+                self.analyze_assoc_elems(scope, &mut instance.generic_map, diagnostics)?;
+                self.analyze_assoc_elems(scope, &mut instance.port_map, diagnostics)?;
             }
         };
 
+        Ok(())
+    }
+
+    pub fn sensitivity_list_check(
+        &self,
+        scope: &Scope<'a>,
+        names: &mut [WithPos<Name>],
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) -> FatalResult {
+        for name in names.iter_mut() {
+            if let Some(object_name) = as_fatal(self.resolve_object_name(
+                scope,
+                &name.pos,
+                &mut name.item,
+                "is not a signal and cannot be in a sensitivity list",
+                diagnostics,
+            ))? {
+                if object_name.base.class() != ObjectClass::Signal {
+                    diagnostics.error(
+                        &name.pos,
+                        format!(
+                            "{} is not a signal and cannot be in a sensitivity list",
+                            object_name.base.describe_class()
+                        ),
+                    )
+                } else if object_name.base.mode() == Some(Mode::Out) && !object_name.base.is_port()
+                {
+                    diagnostics.error(
+                        &name.pos,
+                        format!(
+                            "{} cannot be in a sensitivity list",
+                            object_name.base.describe_class()
+                        ),
+                    )
+                }
+            }
+        }
         Ok(())
     }
 }

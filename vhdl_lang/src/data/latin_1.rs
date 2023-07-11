@@ -8,7 +8,7 @@ use super::Position;
 use std::fmt;
 use std::str;
 
-fn iso_8859_1_to_utf8(bytes: &[u8]) -> String {
+pub fn iso_8859_1_to_utf8(bytes: &[u8]) -> String {
     let mut utf8_bytes = Vec::new();
     for byte in bytes.iter() {
         let byte = *byte;
@@ -104,6 +104,14 @@ impl Latin1String {
         latin1
     }
 
+    pub fn starts_with(&self, other: &Latin1String) -> bool {
+        if other.len() <= self.len() {
+            self.bytes[0..other.len()] == other.bytes
+        } else {
+            false
+        }
+    }
+
     #[cfg(test)]
     pub fn from_utf8_unchecked(string: &str) -> Latin1String {
         Self::from_utf8(string).unwrap()
@@ -160,6 +168,12 @@ impl Latin1String {
             }
         }
         Ok(Latin1String::from_vec(latin1_bytes))
+    }
+}
+
+impl Default for Latin1String {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 

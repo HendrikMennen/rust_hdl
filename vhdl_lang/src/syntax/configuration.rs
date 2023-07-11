@@ -4,26 +4,26 @@
 //
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
-use super::common::error_on_end_identifier_mismatch;
+use super::common::check_end_identifier_mismatch;
 use super::common::ParseResult;
 use super::concurrent_statement::parse_generic_and_port_map;
-use super::context::parse_use_clause_no_keyword;
-use super::names::{parse_name, parse_name_initial_token, parse_selected_name};
+use super::context::parse_use_clause;
+use super::names::{parse_name, parse_selected_name};
 use super::tokens::{Kind::*, TokenStream};
 use crate::ast::*;
 use crate::data::*;
 
 /// LRM 7.3.2.2
-fn parse_entity_aspect(stream: &mut TokenStream) -> ParseResult<EntityAspect> {
-    let token = stream.expect()?;
-    let entity_aspect = try_token_kind!(
+fn parse_entity_aspect(stream: &TokenStream) -> ParseResult<EntityAspect> {
+    let entity_aspect = expect_token!(
+        stream,
         token,
         Open => EntityAspect::Open,
         Configuration => EntityAspect::Configuration(parse_selected_name(stream)?),
         Entity => {
             let entity_name = parse_selected_name(stream)?;
             let arch_name = {
-                if stream.skip_if_kind(LeftPar)? {
+                if stream.skip_if_kind(LeftPar) {
                     let ident = stream.expect_ident()?;
                     stream.expect_kind(RightPar)?;
                     Some(ident)
@@ -39,7 +39,7 @@ fn parse_entity_aspect(stream: &mut TokenStream) -> ParseResult<EntityAspect> {
 
 fn parse_binding_indication_known_entity_aspect(
     entity_aspect: Option<EntityAspect>,
-    stream: &mut TokenStream,
+    stream: &TokenStream,
 ) -> ParseResult<BindingIndication> {
     let (generic_map, port_map) = parse_generic_and_port_map(stream)?;
 
@@ -52,8 +52,8 @@ fn parse_binding_indication_known_entity_aspect(
 }
 
 /// LRM 7.3.2
-fn parse_binding_indication(stream: &mut TokenStream) -> ParseResult<BindingIndication> {
-    let entity_aspect = if stream.skip_if_kind(Use)? {
+fn parse_binding_indication(stream: &TokenStream) -> ParseResult<BindingIndication> {
+    let entity_aspect = if stream.skip_if_kind(Use) {
         Some(parse_entity_aspect(stream)?)
     } else {
         None
@@ -62,25 +62,25 @@ fn parse_binding_indication(stream: &mut TokenStream) -> ParseResult<BindingIndi
 }
 
 fn parse_component_configuration_known_spec(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     spec: ComponentSpecification,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<ComponentConfiguration> {
-    let token = stream.peek_expect()?;
-    let (bind_ind, vunit_bind_inds) = try_token_kind!(
+    let (bind_ind, vunit_bind_inds) = peek_token!(
+        stream,
         token,
         End => (None, Vec::new()),
         For => (None, Vec::new()),
         Use => {
-            stream.move_after(&token);
-            if stream.peek_kind()? == Some(Vunit) {
+            stream.skip();
+            if stream.peek_kind() == Some(Vunit) {
                 let vunit_bind_inds = parse_vunit_binding_indication_list_known_keyword(stream)?;
                 (None, vunit_bind_inds)
             } else {
                 let aspect = parse_entity_aspect(stream)?;
                 let bind_ind = parse_binding_indication_known_entity_aspect(Some(aspect), stream)?;
 
-                if stream.skip_if_kind(Use)? {
+                if stream.skip_if_kind(Use) {
                     (Some(bind_ind), parse_vunit_binding_indication_list_known_keyword(stream)?)
                 } else {
                     (Some(bind_ind), Vec::new())
@@ -89,8 +89,8 @@ fn parse_component_configuration_known_spec(
         }
     );
 
-    let token = stream.expect()?;
-    let block_config = try_token_kind!(
+    let block_config = expect_token!(
+        stream,
         token,
         End => None,
         For => {
@@ -116,12 +116,12 @@ enum ComponentSpecificationOrName {
 }
 
 fn parse_component_specification_or_name(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
 ) -> ParseResult<ComponentSpecificationOrName> {
-    let name_token = stream.expect()?;
-    try_token_kind!(
-        name_token,
+    peek_token!(
+        stream, token,
         All => {
+            stream.skip();
             stream.expect_kind(Colon)?;
             let component_name = parse_selected_name(stream)?;
             Ok(ComponentSpecificationOrName::ComponentSpec(ComponentSpecification {
@@ -131,6 +131,7 @@ fn parse_component_specification_or_name(
 
         },
         Others => {
+            stream.skip();
             stream.expect_kind(Colon)?;
             let component_name = parse_selected_name(stream)?;
             Ok(ComponentSpecificationOrName::ComponentSpec(ComponentSpecification {
@@ -139,11 +140,11 @@ fn parse_component_specification_or_name(
             }))
         },
         Identifier => {
-            let name = parse_name_initial_token(stream, name_token)?;
+            let name = parse_name(stream)?;
             let sep_token = stream.peek_expect()?;
             match sep_token.kind {
                 Colon => {
-                    stream.move_after(&sep_token);
+                    stream.skip();
                     let ident = to_simple_name(name)?;
                     let component_name = parse_selected_name(stream)?;
                     Ok(ComponentSpecificationOrName::ComponentSpec(ComponentSpecification {
@@ -152,12 +153,12 @@ fn parse_component_specification_or_name(
                     }))
                 }
                 Comma => {
-                    stream.move_after(&sep_token);
+                    stream.skip();
                     let mut idents = vec![to_simple_name(name)?];
                     loop {
                         idents.push(stream.expect_ident()?);
-                        let next_token = stream.expect()?;
-                        try_token_kind!(
+                        expect_token!(
+                            stream,
                             next_token,
                             Comma => {},
                             Colon => break
@@ -176,7 +177,7 @@ fn parse_component_specification_or_name(
 }
 
 fn parse_configuration_item_known_keyword(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<ConfigurationItem> {
     match parse_component_specification_or_name(stream)? {
@@ -192,7 +193,7 @@ fn parse_configuration_item_known_keyword(
 }
 
 fn parse_block_configuration_known_name(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     name: WithPos<Name>,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<BlockConfiguration> {
@@ -202,8 +203,8 @@ fn parse_block_configuration_known_name(
     let mut items = Vec::new();
 
     loop {
-        let token = stream.expect()?;
-        try_token_kind!(
+        expect_token!(
+            stream,
             token,
             End => {
                 break;
@@ -223,7 +224,7 @@ fn parse_block_configuration_known_name(
 }
 
 fn parse_block_configuration_known_keyword(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<BlockConfiguration> {
     let name = parse_name(stream)?;
@@ -231,7 +232,7 @@ fn parse_block_configuration_known_keyword(
 }
 
 fn parse_vunit_binding_indication_list_known_keyword(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
 ) -> ParseResult<Vec<VUnitBindingIndication>> {
     let mut indications = Vec::new();
     loop {
@@ -241,14 +242,13 @@ fn parse_vunit_binding_indication_list_known_keyword(
 
         let vunit_bind_ind = loop {
             vunit_list.push(parse_name(stream)?);
-            let token = stream.peek_expect()?;
-            try_token_kind!(
-                token,
+            peek_token!(
+                stream, token,
                 Comma => {
-                    stream.move_after(&token);
+                    stream.skip();
                 },
                 SemiColon => {
-                    stream.move_after(&token);
+                    stream.skip();
                     break VUnitBindingIndication { vunit_list };
                 }
             );
@@ -256,7 +256,7 @@ fn parse_vunit_binding_indication_list_known_keyword(
 
         indications.push(vunit_bind_ind);
 
-        if !stream.skip_if_kind(Use)? {
+        if !stream.skip_if_kind(Use) {
             break;
         }
     }
@@ -265,11 +265,11 @@ fn parse_vunit_binding_indication_list_known_keyword(
 
 /// LRM 3.4 Configuration declaration
 pub fn parse_configuration_declaration(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<ConfigurationDeclaration> {
     stream.expect_kind(Configuration)?;
-    let ident = stream.expect_ident()?;
+    let ident = WithDecl::new(stream.expect_ident()?);
     stream.expect_kind(Of)?;
     let entity_name = parse_selected_name(stream)?;
     stream.expect_kind(Is)?;
@@ -279,14 +279,12 @@ pub fn parse_configuration_declaration(
         let token = stream.peek_expect()?;
         match token.kind {
             Use => {
-                stream.move_after(&token);
-                if stream.peek_kind()? == Some(Vunit) {
+                if stream.nth_kind_is(1, Vunit) {
+                    stream.skip();
                     break parse_vunit_binding_indication_list_known_keyword(stream)?;
                 }
 
-                decl.push(ConfigurationDeclarativeItem::Use(
-                    parse_use_clause_no_keyword(token, stream)?,
-                ));
+                decl.push(ConfigurationDeclarativeItem::Use(parse_use_clause(stream)?));
             }
             _ => break Vec::new(),
         }
@@ -296,15 +294,14 @@ pub fn parse_configuration_declaration(
     let block_config = parse_block_configuration_known_keyword(stream, diagnostics)?;
 
     stream.expect_kind(End)?;
-    stream.pop_if_kind(Configuration)?;
-    let end_ident = stream.pop_optional_ident()?;
-    if let Some(diagnostic) = error_on_end_identifier_mismatch(&ident, &end_ident) {
-        diagnostics.push(diagnostic)
-    }
+    stream.pop_if_kind(Configuration);
+    let end_ident = stream.pop_optional_ident();
     stream.expect_kind(SemiColon)?;
+
     Ok(ConfigurationDeclaration {
         context_clause: ContextClause::default(),
-        ident: ident.into(),
+        end_ident_pos: check_end_identifier_mismatch(&ident.tree, end_ident, diagnostics),
+        ident,
         entity_name,
         decl,
         vunit_bind_inds,
@@ -314,13 +311,13 @@ pub fn parse_configuration_declaration(
 
 /// LRM 7.3 Configuration Specification
 pub fn parse_configuration_specification(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
 ) -> ParseResult<ConfigurationSpecification> {
     stream.expect_kind(For)?;
     match parse_component_specification_or_name(stream)? {
         ComponentSpecificationOrName::ComponentSpec(spec) => {
             let bind_ind = parse_binding_indication(stream)?;
-            if stream.skip_if_kind(Use)? {
+            if stream.skip_if_kind(Use) {
                 let vunit_bind_inds = parse_vunit_binding_indication_list_known_keyword(stream)?;
                 stream.expect_kind(End)?;
                 stream.expect_kind(For)?;
@@ -331,7 +328,7 @@ pub fn parse_configuration_specification(
                     vunit_bind_inds,
                 })
             } else {
-                if stream.skip_if_kind(End)? {
+                if stream.skip_if_kind(End) {
                     stream.expect_kind(For)?;
                     stream.expect_kind(SemiColon)?;
                 }
@@ -375,7 +372,8 @@ end;
                     block_spec: code.s1("rtl(0)").name(),
                     use_clauses: vec![],
                     items: vec![],
-                }
+                },
+                end_ident_pos: None,
             }
         );
     }
@@ -402,7 +400,8 @@ end configuration cfg;
                     block_spec: code.s1("rtl(0)").name(),
                     use_clauses: vec![],
                     items: vec![],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -433,7 +432,8 @@ end configuration cfg;
                     block_spec: code.s1("rtl(0)").name(),
                     use_clauses: vec![],
                     items: vec![],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -466,7 +466,8 @@ end configuration cfg;
                     block_spec: code.s1("rtl(0)").name(),
                     use_clauses: vec![],
                     items: vec![],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -493,7 +494,8 @@ end configuration cfg;
                     block_spec: code.s1("rtl(0)").name(),
                     use_clauses: vec![],
                     items: vec![],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -535,7 +537,8 @@ end configuration cfg;
                             items: vec![],
                         })
                     ],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -580,7 +583,8 @@ end configuration cfg;
                             items: vec![],
                         }),
                     }),],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -636,7 +640,8 @@ end configuration cfg;
                             items: vec![],
                         }),
                     }),],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -683,7 +688,8 @@ end configuration cfg;
                         vunit_bind_inds: Vec::new(),
                         block_config: None,
                     }),],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }
@@ -761,7 +767,8 @@ end configuration cfg;
                             block_config: None,
                         })
                     ],
-                }
+                },
+                end_ident_pos: Some(code.s("cfg", 2).pos())
             }
         );
     }

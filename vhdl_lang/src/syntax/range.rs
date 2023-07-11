@@ -6,16 +6,16 @@
 
 use super::common::parse_optional;
 use super::common::ParseResult;
+use super::expression::name_to_type_mark;
 use super::expression::parse_expression;
-use super::names::into_selected_name;
 use super::tokens::{Kind::*, TokenStream};
 use crate::ast;
 use crate::ast::*;
 use crate::data::{Diagnostic, WithPos};
 
-pub fn parse_direction(stream: &mut TokenStream) -> ParseResult<Direction> {
-    Ok(try_token_kind!(
-        stream.expect()?,
+pub fn parse_direction(stream: &TokenStream) -> ParseResult<Direction> {
+    Ok(expect_token!(
+        stream, token,
         To => Direction::Ascending,
         Downto => Direction::Descending
     ))
@@ -26,10 +26,10 @@ enum NameOrRange {
     Range(WithPos<ast::Range>),
 }
 
-fn parse_name_or_range(stream: &mut TokenStream) -> ParseResult<NameOrRange> {
+fn parse_name_or_range(stream: &TokenStream) -> ParseResult<NameOrRange> {
     let expr = parse_expression(stream)?;
 
-    match stream.peek_kind()? {
+    match stream.peek_kind() {
         Some(To) | Some(Downto) => {
             let direction = parse_direction(stream)?;
             let right_expr = parse_expression(stream)?;
@@ -51,62 +51,64 @@ fn parse_name_or_range(stream: &mut TokenStream) -> ParseResult<NameOrRange> {
         pos,
     } = expr
     {
-        if let Name::Attribute(ref attribute_name) = *name.as_ref() {
-            if &attribute_name.attr.item == stream.range_sym()
-                || &attribute_name.attr.item == stream.reverse_range_sym()
-            {
-                // @TODO avoid clone
-                let range = ast::Range::Attribute(attribute_name.clone());
-                return Ok(NameOrRange::Range(WithPos::from(range, pos)));
+        if let Name::Attribute(attribute_name) = *name {
+            if attribute_name.as_range().is_some() {
+                let range = ast::Range::Attribute(attribute_name);
+                Ok(NameOrRange::Range(WithPos::from(range, pos)))
+            } else {
+                Ok(NameOrRange::Name(WithPos::from(
+                    Name::Attribute(attribute_name),
+                    pos,
+                )))
             }
+        } else {
+            Ok(NameOrRange::Name(WithPos::from(*name, pos)))
         }
-        return Ok(NameOrRange::Name(WithPos::from(*name, pos)));
+    } else {
+        Err(Diagnostic::error(&expr, "Expected name or range"))
     }
-
-    Err(Diagnostic::error(&expr, "Expected name or range"))
 }
 
 /// {selected_name}'range
 /// {selected_name}'reverse_range
 /// 2. {expr} to|downto {expr}
-pub fn parse_range(stream: &mut TokenStream) -> ParseResult<WithPos<ast::Range>> {
+pub fn parse_range(stream: &TokenStream) -> ParseResult<WithPos<ast::Range>> {
     match parse_name_or_range(stream)? {
         NameOrRange::Range(range) => Ok(range),
         NameOrRange::Name(name) => Err(Diagnostic::error(&name, "Expected range")),
     }
 }
 
-pub fn parse_discrete_range(stream: &mut TokenStream) -> ParseResult<DiscreteRange> {
+pub fn parse_discrete_range(stream: &TokenStream) -> ParseResult<DiscreteRange> {
     match parse_name_or_range(stream) {
         Ok(NameOrRange::Range(range)) => Ok(DiscreteRange::Range(range.item)),
         Ok(NameOrRange::Name(name)) => {
-            let selected_name = into_selected_name(name)?;
+            let type_mark = name_to_type_mark(name)?;
             let range = parse_optional(stream, Range, parse_range)?.map(|range| range.item);
-            Ok(DiscreteRange::Discrete(selected_name, range))
+            Ok(DiscreteRange::Discrete(type_mark, range))
         }
         Err(diagnostic) => Err(diagnostic.when("parsing discrete_range")),
     }
 }
 
-pub fn parse_array_index_constraint(stream: &mut TokenStream) -> ParseResult<ArrayIndex> {
+pub fn parse_array_index_constraint(stream: &TokenStream) -> ParseResult<ArrayIndex> {
     match parse_name_or_range(stream) {
         Ok(NameOrRange::Range(range)) => Ok(ArrayIndex::Discrete(DiscreteRange::Range(range.item))),
         Ok(NameOrRange::Name(name)) => {
-            let selected_name = into_selected_name(name)?;
+            let type_mark = name_to_type_mark(name)?;
 
-            if stream.skip_if_kind(Range)? {
-                if stream.skip_if_kind(BOX)? {
-                    Ok(ArrayIndex::IndexSubtypeDefintion(selected_name))
+            if stream.skip_if_kind(Range) {
+                if stream.skip_if_kind(BOX) {
+                    Ok(ArrayIndex::IndexSubtypeDefintion(type_mark))
                 } else {
                     Ok(ArrayIndex::Discrete(DiscreteRange::Discrete(
-                        selected_name,
+                        type_mark,
                         Some(parse_range(stream)?.item),
                     )))
                 }
             } else {
                 Ok(ArrayIndex::Discrete(DiscreteRange::Discrete(
-                    selected_name,
-                    None,
+                    type_mark, None,
                 )))
             }
         }
@@ -204,7 +206,7 @@ mod tests {
         let code = Code::new("foo.bar");
         assert_eq!(
             code.with_stream(parse_discrete_range),
-            DiscreteRange::Discrete(code.s1("foo.bar").selected_name(), None)
+            DiscreteRange::Discrete(code.s1("foo.bar").type_mark(), None)
         );
     }
 
@@ -214,7 +216,7 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_discrete_range),
             DiscreteRange::Discrete(
-                code.s1("foo.bar").selected_name(),
+                code.s1("foo.bar").type_mark(),
                 Some(code.s1("1 to 4").range())
             )
         );
@@ -225,7 +227,7 @@ mod tests {
         let code = Code::new("foo.bar range <>");
         assert_eq!(
             code.with_stream(parse_array_index_constraint),
-            ArrayIndex::IndexSubtypeDefintion(code.s1("foo.bar").selected_name())
+            ArrayIndex::IndexSubtypeDefintion(code.s1("foo.bar").type_mark())
         );
     }
 

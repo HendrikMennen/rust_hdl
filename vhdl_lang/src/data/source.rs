@@ -244,7 +244,7 @@ impl Range {
 pub struct SrcPos {
     /// The referenced source file.
     pub source: Source,
-    range: Range,
+    pub range: Range,
 }
 
 impl Ord for SrcPos {
@@ -432,9 +432,9 @@ impl SrcPos {
             let overlaps = self.range.start.line <= *lineno && *lineno <= self.range.end.line;
 
             if overlaps {
-                write!(result, "{} --> ", lineno_str).unwrap();
+                write!(result, "{lineno_str} --> ").unwrap();
             } else {
-                write!(result, "{}  |  ", lineno_str).unwrap();
+                write!(result, "{lineno_str}  |  ").unwrap();
             }
 
             for chr in line.trim_end().chars() {
@@ -510,6 +510,20 @@ impl SrcPos {
 
     pub fn end(&self) -> Position {
         self.range.end
+    }
+
+    pub fn pos_at_end(&self) -> SrcPos {
+        SrcPos {
+            source: self.source.clone(),
+            range: Range::new(self.range.end, self.range.end),
+        }
+    }
+
+    pub fn pos_at_beginning(&self) -> SrcPos {
+        SrcPos {
+            source: self.source.clone(),
+            range: Range::new(self.range.start, self.range.start),
+        }
     }
 
     pub fn range(&self) -> Range {

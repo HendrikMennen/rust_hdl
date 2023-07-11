@@ -1,4 +1,5 @@
 use super::analyze::*;
+use super::named_entity::*;
 use super::names::*;
 use super::region::*;
 use crate::ast::*;
@@ -11,73 +12,58 @@ use crate::data::*;
 ///   target(0).elem := 1
 
 impl<'a> AnalyzeContext<'a> {
-    pub fn analyze_target(
+    pub fn resolve_target(
         &self,
-        parent: &Region<'_>,
+        scope: &Scope<'a>,
         target: &mut WithPos<Target>,
         assignment_type: AssignmentType,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> EvalResult<TypeEnt<'a>> {
         match target.item {
             Target::Name(ref mut name) => {
-                self.analyze_target_name(parent, name, &target.pos, assignment_type, diagnostics)?;
-                Ok(())
+                self.resolve_target_name(scope, name, &target.pos, assignment_type, diagnostics)
             }
             Target::Aggregate(ref mut assocs) => {
-                self.analyze_aggregate(parent, assocs, diagnostics)?;
-                Ok(())
+                self.analyze_aggregate(scope, assocs, diagnostics)?;
+                Err(EvalError::Unknown)
             }
         }
     }
 
-    pub fn analyze_target_name(
+    pub fn resolve_target_name(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
         target: &mut Name,
         target_pos: &SrcPos,
         assignment_type: AssignmentType,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        match self.resolve_object_prefix(
-            region,
+    ) -> EvalResult<TypeEnt<'a>> {
+        let object_name = self.resolve_object_name(
+            scope,
             target_pos,
             target,
-            "Invalid assignment target",
+            "may not be the target of an assignment",
             diagnostics,
-        ) {
-            Ok(resolved_name) => {
-                if let ResolvedName::ObjectSelection {
-                    ref base_object, ..
-                } = resolved_name
-                {
-                    if !is_valid_assignment_target(base_object) {
-                        diagnostics.push(Diagnostic::error(
-                            target_pos,
-                            format!(
-                                "{} may not be the target of an assignment",
-                                base_object.describe_class()
-                            ),
-                        ));
-                    } else if !is_valid_assignment_type(base_object, assignment_type) {
-                        diagnostics.push(Diagnostic::error(
-                            target_pos,
-                            format!(
-                                "{} may not be the target of a {} assignment",
-                                base_object.describe_class(),
-                                assignment_type.to_str()
-                            ),
-                        ));
-                    }
-                } else {
-                    diagnostics.push(Diagnostic::error(target_pos, "Invalid assignment target"));
-                }
-            }
-            Err(err) => {
-                err.add_to(diagnostics)?;
-            }
+        )?;
+        if !is_valid_assignment_target(&object_name.base) {
+            diagnostics.push(Diagnostic::error(
+                target_pos,
+                format!(
+                    "{} may not be the target of an assignment",
+                    object_name.base.describe_class()
+                ),
+            ));
+        } else if !is_valid_assignment_type(&object_name.base, assignment_type) {
+            diagnostics.push(Diagnostic::error(
+                target_pos,
+                format!(
+                    "{} may not be the target of a {} assignment",
+                    object_name.base.describe_class(),
+                    assignment_type.to_str()
+                ),
+            ));
         }
-
-        Ok(())
+        Ok(object_name.type_mark())
     }
 }
 
@@ -99,14 +85,13 @@ impl AssignmentType {
 }
 
 /// Check that the assignment target is a writable object and not constant or input only
-fn is_valid_assignment_target(ent: &ObjectEnt) -> bool {
-    let object = ent.object();
-    object.class != ObjectClass::Constant && !matches!(object.mode, Some(Mode::In))
+fn is_valid_assignment_target(base: &ObjectBase) -> bool {
+    base.class() != ObjectClass::Constant && !matches!(base.mode(), Some(Mode::In))
 }
 
 // Check that a signal is not the target of a variable assignment and vice-versa
-fn is_valid_assignment_type(ent: &ObjectEnt, assignment_type: AssignmentType) -> bool {
-    let class = ent.class();
+fn is_valid_assignment_type(base: &ObjectBase, assignment_type: AssignmentType) -> bool {
+    let class = base.class();
     match assignment_type {
         AssignmentType::Signal => matches!(class, ObjectClass::Signal),
         AssignmentType::Variable => {

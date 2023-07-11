@@ -4,101 +4,373 @@
 //
 // Copyright (c) 2022, Olof Kraigher olof.kraigher@gmail.com
 
-use std::sync::Arc;
-
+use crate::ast::Declaration;
 use crate::ast::Designator;
 use crate::ast::Mode;
 use crate::ast::ObjectClass;
 use crate::ast::Operator;
-use crate::data::Symbol;
+use crate::data::DiagnosticHandler;
 use crate::syntax::Symbols;
 
+use super::analyze::AnalyzeContext;
 use super::formal_region::FormalRegion;
-use super::named_entity::Signature;
-use super::region::NamedEntityKind;
-use super::region::Object;
-use super::region::Region;
-use super::region::Subtype;
-use super::region::TypeEnt;
-use super::root::UnitReadGuard;
-use super::NamedEntity;
+use super::named_entity::*;
+use super::region::*;
+use super::EntityId;
 
-pub(super) enum RegionRef<'a> {
-    // Inside the standard package itself we can hold a reference
-    Inside(&'a Region<'a>),
-    // Outside we need an analysis result
-    Outside(UnitReadGuard<'a>),
+#[derive(Clone, Copy)]
+pub(crate) struct UniversalTypes {
+    pub integer: EntityId,
+    pub real: EntityId,
 }
 
-impl<'a> std::ops::Deref for RegionRef<'a> {
-    type Target = Region<'a>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            RegionRef::Inside(r) => r,
-            RegionRef::Outside(r) => &r.result().region,
+impl UniversalTypes {
+    pub fn new<'a>(arena: &'a Arena, standard_pkg: EntRef<'a>, symbols: &Symbols) -> Self {
+        let integer = arena.explicit(
+            Designator::Identifier(symbols.symtab().insert_utf8("universal_integer")),
+            standard_pkg,
+            AnyEntKind::Type(Type::Universal(UniversalType::Integer)),
+            standard_pkg.decl_pos(),
+        );
+
+        let real = arena.explicit(
+            Designator::Identifier(symbols.symtab().insert_utf8("universal_real")),
+            standard_pkg,
+            AnyEntKind::Type(Type::Universal(UniversalType::Real)),
+            standard_pkg.decl_pos(),
+        );
+
+        Self {
+            real: real.id(),
+            integer: integer.id(),
         }
     }
 }
 
-pub(super) struct StandardRegion<'a> {
-    // Only for symbol table
-    symbols: &'a Symbols,
-    region: RegionRef<'a>,
+pub(crate) struct StandardTypes {
+    pub boolean: EntityId,
+    pub boolean_vector: EntityId,
+    pub bit: EntityId,
+    pub bit_vector: EntityId,
+    pub character: EntityId,
+    pub string: EntityId,
+    pub integer: EntityId,
+    pub natural: EntityId,
+    pub real: EntityId,
+    pub time: EntityId,
+    pub file_open_kind: EntityId,
+    pub file_open_status: EntityId,
+    pub severity_level: EntityId,
 }
 
-impl<'a> StandardRegion<'a> {
-    pub(super) fn new(symbols: &'a Symbols, region: RegionRef<'a>) -> Self {
-        Self { symbols, region }
+impl StandardTypes {
+    pub fn new<'a>(arena: &'a Arena, standard_pkg: EntRef<'a>, decls: &mut [Declaration]) -> Self {
+        let mut boolean = None;
+        let mut boolean_vector = None;
+        let mut bit = None;
+        let mut bit_vector = None;
+        let mut character = None;
+        let mut string = None;
+        let mut integer = None;
+        let mut natural = None;
+        let mut real = None;
+        let mut time = None;
+        let mut file_open_status = None;
+        let mut file_open_kind = None;
+        let mut severity_level = None;
+
+        // Reserve space in the arena for the standard types
+        for decl in decls.iter_mut() {
+            if let Declaration::Type(ref mut type_decl) = decl {
+                let id = arena
+                    .alloc(
+                        Designator::Identifier(type_decl.ident.tree.item.clone()),
+                        Some(standard_pkg),
+                        Related::None,
+                        AnyEntKind::Type(Type::Incomplete),
+                        Some(type_decl.ident.tree.pos.clone()),
+                    )
+                    .id();
+                let name = type_decl.ident.tree.item.name();
+                match name.bytes.as_slice() {
+                    b"BOOLEAN" => {
+                        boolean = Some(id);
+                    }
+                    b"BOOLEAN_VECTOR" => {
+                        boolean_vector = Some(id);
+                    }
+                    b"BIT" => {
+                        bit = Some(id);
+                    }
+                    b"BIT_VECTOR" => {
+                        bit_vector = Some(id);
+                    }
+                    b"CHARACTER" => {
+                        character = Some(id);
+                    }
+                    b"STRING" => {
+                        string = Some(id);
+                    }
+                    b"INTEGER" => {
+                        integer = Some(id);
+                    }
+                    b"NATURAL" => {
+                        natural = Some(id);
+                    }
+                    b"REAL" => {
+                        real = Some(id);
+                    }
+                    b"TIME" => {
+                        time = Some(id);
+                    }
+                    b"FILE_OPEN_KIND" => {
+                        file_open_kind = Some(id);
+                    }
+                    b"FILE_OPEN_STATUS" => {
+                        file_open_status = Some(id);
+                    }
+                    b"SEVERITY_LEVEL" => {
+                        severity_level = Some(id);
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
+                type_decl.ident.decl = Some(id);
+            }
+        }
+
+        Self {
+            boolean: boolean.unwrap(),
+            boolean_vector: boolean_vector.unwrap(),
+            bit: bit.unwrap(),
+            bit_vector: bit_vector.unwrap(),
+            character: character.unwrap(),
+            string: string.unwrap(),
+            integer: integer.unwrap(),
+            natural: natural.unwrap(),
+            real: real.unwrap(),
+            time: time.unwrap(),
+            file_open_kind: file_open_kind.unwrap(),
+            file_open_status: file_open_status.unwrap(),
+            severity_level: severity_level.unwrap(),
+        }
+    }
+}
+
+impl<'a> AnalyzeContext<'a> {
+    fn ident(&self, name: &str) -> Designator {
+        Designator::Identifier(self.root.symbol_utf8(name))
     }
 
-    fn symbol(&self, name: &str) -> Symbol {
-        self.symbols.symtab().insert_utf8(name)
+    fn standard_types(&self) -> &StandardTypes {
+        self.root.standard_types.as_ref().unwrap()
     }
 
-    fn lookup_type(&self, name: &str) -> TypeEnt {
-        TypeEnt::from_any(
-            self.region
-                .lookup_immediate(&self.symbol(name).into())
-                .unwrap()
-                .clone()
-                .into_non_overloaded()
-                .unwrap(),
+    pub(crate) fn string(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().string)
+    }
+
+    pub(crate) fn boolean(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().boolean)
+    }
+
+    pub(crate) fn boolean_vector(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().boolean_vector)
+    }
+
+    pub(crate) fn bit(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().bit)
+    }
+
+    pub(crate) fn bit_vector(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().bit_vector)
+    }
+
+    pub(crate) fn natural(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().natural)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn character(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().character)
+    }
+
+    pub(crate) fn universal_integer(&self) -> BaseType<'a> {
+        self.arena
+            .get_type(self.root.universal.as_ref().unwrap().integer)
+            .base()
+    }
+
+    pub(crate) fn universal_real(&self) -> BaseType<'a> {
+        self.arena
+            .get_type(self.root.universal.as_ref().unwrap().real)
+            .base()
+    }
+
+    pub(crate) fn integer(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().integer)
+    }
+
+    pub(crate) fn real(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().real)
+    }
+
+    pub(crate) fn time(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().time)
+    }
+
+    fn file_open_kind(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().file_open_kind)
+    }
+
+    fn file_open_status(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().file_open_status)
+    }
+
+    pub(crate) fn severity_level(&self) -> TypeEnt<'a> {
+        self.arena.get_type(self.standard_types().severity_level)
+    }
+
+    /// Create implicit MAXIMUM/MINIMUM
+    // function MINIMUM (L, R: T) return T;
+    // function MAXIMUM (L, R: T) return T;
+    fn min_or_maximum(&self, name: &str, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.implicit_subpgm(
+            type_ent,
+            self.ident(name),
+            [
+                (
+                    self.ident("L"),
+                    AnyEntKind::Object(Object::const_param(Subtype::new(type_ent))),
+                ),
+                (
+                    self.ident("R"),
+                    AnyEntKind::Object(Object::const_param(Subtype::new(type_ent))),
+                ),
+            ],
+            Some(type_ent),
         )
-        .unwrap()
+        .into()
     }
 
-    fn string(&self) -> TypeEnt {
-        self.lookup_type("STRING")
+    fn elementwise_min_or_maximum(
+        &self,
+        name: &str,
+        arr_typ: TypeEnt<'a>,
+        elem_typ: TypeEnt<'a>,
+    ) -> EntRef<'a> {
+        self.implicit_subpgm(
+            arr_typ,
+            self.ident(name),
+            [(
+                self.ident("L"),
+                AnyEntKind::Object(Object::const_param(Subtype::new(arr_typ))),
+            )],
+            Some(elem_typ),
+        )
+        .into()
     }
 
-    fn boolean(&self) -> TypeEnt {
-        self.lookup_type("BOOLEAN")
+    fn unary(&self, op: Operator, typ: TypeEnt<'a>, return_type: TypeEnt<'a>) -> EntRef<'a> {
+        self.implicit_subpgm(
+            typ,
+            Designator::OperatorSymbol(op),
+            [(
+                Designator::Anonymous(0),
+                AnyEntKind::Object(Object::const_param(Subtype::new(typ))),
+            )],
+            Some(return_type),
+        )
+        .into()
     }
 
-    fn natural(&self) -> TypeEnt {
-        self.lookup_type("NATURAL")
+    pub(crate) fn symmetric_unary(&self, op: Operator, typ: TypeEnt<'a>) -> EntRef<'a> {
+        self.unary(op, typ, typ)
     }
 
-    fn real(&self) -> TypeEnt {
-        self.lookup_type("REAL")
+    fn implicit_subpgm(
+        &self,
+        implicit_of: TypeEnt<'a>,
+        des: Designator,
+        formals: impl IntoIterator<Item = (Designator, AnyEntKind<'a>)>,
+        return_type: Option<TypeEnt<'a>>,
+    ) -> OverloadedEnt<'a> {
+        let mut region = FormalRegion::new_params();
+
+        let subpgm_ent = self.arena.implicit(
+            implicit_of.into(),
+            des,
+            AnyEntKind::Overloaded(Overloaded::SubprogramDecl(Signature::new(
+                FormalRegion::new_params(),
+                return_type,
+            ))),
+            implicit_of.decl_pos(),
+        );
+
+        for (name, kind) in formals.into_iter() {
+            region.add(
+                self.arena
+                    .explicit(name, subpgm_ent, kind, implicit_of.decl_pos()),
+            );
+        }
+
+        let kind = if let Some(return_type) = return_type {
+            AnyEntKind::new_function_decl(region, return_type)
+        } else {
+            AnyEntKind::new_procedure_decl(region)
+        };
+
+        unsafe {
+            subpgm_ent.set_kind(kind);
+        }
+        OverloadedEnt::from_any(subpgm_ent).unwrap()
     }
 
-    fn time(&self) -> TypeEnt {
-        self.lookup_type("TIME")
+    fn binary(
+        &self,
+
+        op: Operator,
+        implicit_of: TypeEnt<'a>,
+        left: TypeEnt<'a>,
+        right: TypeEnt<'a>,
+        return_type: TypeEnt<'a>,
+    ) -> EntRef<'a> {
+        self.implicit_subpgm(
+            implicit_of,
+            Designator::OperatorSymbol(op),
+            [
+                (
+                    Designator::Anonymous(0),
+                    AnyEntKind::Object(Object::const_param(Subtype::new(left))),
+                ),
+                (
+                    Designator::Anonymous(1),
+                    AnyEntKind::Object(Object::const_param(Subtype::new(right))),
+                ),
+            ],
+            Some(return_type),
+        )
+        .into()
     }
 
-    fn file_open_kind(&self) -> TypeEnt {
-        self.lookup_type("FILE_OPEN_KIND")
+    fn symmetric_binary(&self, op: Operator, typ: TypeEnt<'a>) -> EntRef<'a> {
+        self.binary(op, typ, typ, typ, typ)
     }
-    fn file_open_status(&self) -> TypeEnt {
-        self.lookup_type("FILE_OPEN_STATUS")
+
+    pub fn minimum(&self, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.min_or_maximum("MINIMUM", type_ent)
+    }
+
+    pub fn maximum(&self, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.min_or_maximum("MAXIMUM", type_ent)
     }
 
     pub fn create_implicit_file_type_subprograms(
         &self,
-        file_type: &TypeEnt,
-        type_mark: &TypeEnt,
-    ) -> Vec<Arc<NamedEntity>> {
+        file_type: TypeEnt<'a>,
+        type_mark: TypeEnt<'a>,
+    ) -> Vec<EntRef<'a>> {
         let mut implicit = Vec::new();
 
         let string = self.string();
@@ -108,193 +380,124 @@ impl<'a> StandardRegion<'a> {
 
         // procedure FILE_OPEN (file F: FT; External_Name: in STRING; Open_Kind: in FILE_OPEN_KIND := READ_MODE);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("External_Name"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(string.clone()),
-                    has_default: false,
-                }),
-                file_type.decl_pos(),
-            )));
-
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("Open_Kind"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(file_open_kind.clone()),
-                    has_default: true,
-                }),
-                file_type.decl_pos(),
-            )));
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("FILE_OPEN"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("FILE_OPEN"),
+                [
+                    (self.ident("F"), AnyEntKind::InterfaceFile(file_type)),
+                    (
+                        self.ident("External_Name"),
+                        AnyEntKind::Object(Object::const_param(Subtype::new(string))),
+                    ),
+                    (
+                        self.ident("Open_Kind"),
+                        AnyEntKind::Object(
+                            Object::const_param(Subtype::new(file_open_kind)).with_default(),
+                        ),
+                    ),
+                ],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // procedure FILE_OPEN (Status: out FILE_OPEN_STATUS; file F: FT; External_Name: in STRING; Open_Kind: in FILE_OPEN_KIND := READ_MODE);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("Status"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Variable,
-                    mode: Some(Mode::Out),
-                    subtype: Subtype::new(file_open_status),
-                    has_default: false,
-                }),
-                file_type.decl_pos(),
-            )));
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("External_Name"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(string),
-                    has_default: false,
-                }),
-                file_type.decl_pos(),
-            )));
-
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("Open_Kind"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(file_open_kind),
-                    has_default: true,
-                }),
-                file_type.decl_pos(),
-            )));
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("FILE_OPEN"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("FILE_OPEN"),
+                [
+                    (
+                        self.ident("Status"),
+                        AnyEntKind::Object(Object::const_param(Subtype::new(file_open_status))),
+                    ),
+                    (self.ident("F"), AnyEntKind::InterfaceFile(file_type)),
+                    (
+                        self.ident("External_Name"),
+                        AnyEntKind::Object(Object::const_param(Subtype::new(string))),
+                    ),
+                    (
+                        self.ident("Open_Kind"),
+                        AnyEntKind::Object(
+                            Object::const_param(Subtype::new(file_open_kind)).with_default(),
+                        ),
+                    ),
+                ],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // procedure FILE_CLOSE (file F: FT);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("FILE_CLOSE"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("FILE_CLOSE"),
+                [(self.ident("F"), AnyEntKind::InterfaceFile(file_type))],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // procedure READ (file F: FT; VALUE: out TM);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("VALUE"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Variable,
-                    mode: Some(Mode::Out),
-                    subtype: Subtype::new(type_mark.clone()),
-                    has_default: false,
-                }),
-                file_type.decl_pos(),
-            )));
-
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("READ"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("READ"),
+                [
+                    (self.ident("F"), AnyEntKind::InterfaceFile(file_type)),
+                    (
+                        self.ident("VALUE"),
+                        AnyEntKind::Object(Object {
+                            class: ObjectClass::Variable,
+                            iface: Some(ObjectInterface::Parameter(Mode::Out)),
+                            subtype: Subtype::new(type_mark),
+                            has_default: false,
+                        }),
+                    ),
+                ],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // procedure WRITE (file F: FT; VALUE: in TM);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("VALUE"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(type_mark.clone()),
-                    has_default: false,
-                }),
-                file_type.decl_pos(),
-            )));
-
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("WRITE"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("WRITE"),
+                [
+                    (self.ident("F"), AnyEntKind::InterfaceFile(file_type)),
+                    (
+                        self.ident("VALUE"),
+                        AnyEntKind::Object(Object::const_param(Subtype::new(type_mark))),
+                    ),
+                ],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // procedure FLUSH (file F: FT);
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("FLUSH"),
-                NamedEntityKind::Subprogram(Signature::new(params, None)),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("FLUSH"),
+                [(self.ident("F"), AnyEntKind::InterfaceFile(file_type))],
+                None,
+            );
+            implicit.push(ent.into());
         }
 
         // function ENDFILE (file F: FT) return BOOLEAN;
         {
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("F"),
-                NamedEntityKind::InterfaceFile(file_type.to_owned()),
-                file_type.decl_pos(),
-            )));
-
-            implicit.push(Arc::new(NamedEntity::implicit(
-                file_type.clone().into(),
-                self.symbol("ENDFILE"),
-                NamedEntityKind::Subprogram(Signature::new(params, Some(boolean))),
-                file_type.decl_pos(),
-            )));
+            let ent = self.implicit_subpgm(
+                file_type,
+                self.ident("ENDFILE"),
+                [(self.ident("F"), AnyEntKind::InterfaceFile(file_type))],
+                Some(boolean),
+            );
+            implicit.push(ent.into());
         }
 
         implicit
@@ -302,333 +505,415 @@ impl<'a> StandardRegion<'a> {
 
     /// Create implicit TO_STRING
     /// function TO_STRING (VALUE: T) return STRING;
-    pub fn create_to_string(&self, type_ent: TypeEnt) -> Arc<NamedEntity> {
-        let mut params = FormalRegion::new_params();
-        params.add(Arc::new(NamedEntity::new(
-            self.symbol("VALUE"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(type_ent.to_owned()),
-                has_default: false,
-            }),
-            type_ent.decl_pos(),
-        )));
-
-        Arc::new(NamedEntity::implicit(
-            type_ent.clone().into(),
-            self.symbol("TO_STRING"),
-            NamedEntityKind::Subprogram(Signature::new(params, Some(self.string()))),
-            type_ent.decl_pos(),
-        ))
+    pub fn create_to_string(&self, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.to_x_string("TO_STRING", type_ent)
     }
 
-    /// Create implicit MAXIMUM/MINIMUM
-    // function MINIMUM (L, R: T) return T;
-    // function MAXIMUM (L, R: T) return T;
-    fn create_min_or_maximum(&self, name: &str, type_ent: TypeEnt) -> Arc<NamedEntity> {
-        let mut params = FormalRegion::new_params();
-        params.add(Arc::new(NamedEntity::new(
-            self.symbol("L"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(type_ent.to_owned()),
-                has_default: false,
-            }),
-            type_ent.decl_pos(),
-        )));
-
-        params.add(Arc::new(NamedEntity::new(
-            self.symbol("R"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(type_ent.to_owned()),
-                has_default: false,
-            }),
-            type_ent.decl_pos(),
-        )));
-
-        Arc::new(NamedEntity::implicit(
-            type_ent.clone().into(),
-            self.symbol(name),
-            NamedEntityKind::Subprogram(Signature::new(params, Some(type_ent.clone()))),
-            type_ent.decl_pos(),
-        ))
-    }
-
-    fn unary(&self, op: Operator, typ: TypeEnt, return_type: TypeEnt) -> Arc<NamedEntity> {
-        let mut params = FormalRegion::new_params();
-        params.add(Arc::new(NamedEntity::new(
-            // @TODO anonymous
-            self.symbol("V"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(typ.to_owned()),
-                has_default: false,
-            }),
-            typ.decl_pos(),
-        )));
-
-        Arc::new(NamedEntity::implicit(
-            typ.clone().into(),
-            Designator::OperatorSymbol(op),
-            NamedEntityKind::Subprogram(Signature::new(params, Some(return_type))),
-            typ.decl_pos(),
-        ))
-    }
-
-    fn symmetric_unary(&self, op: Operator, typ: TypeEnt) -> Arc<NamedEntity> {
-        self.unary(op, typ.clone(), typ)
-    }
-
-    fn binary(
-        &self,
-        op: Operator,
-        implicit_of: TypeEnt,
-        left: TypeEnt,
-        right: TypeEnt,
-        return_type: TypeEnt,
-    ) -> Arc<NamedEntity> {
-        let mut params = FormalRegion::new_params();
-        params.add(Arc::new(NamedEntity::new(
-            // @TODO anonymous
-            self.symbol("L"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(left),
-                has_default: false,
-            }),
-            implicit_of.decl_pos(),
-        )));
-
-        params.add(Arc::new(NamedEntity::new(
-            // @TODO anonymous
-            self.symbol("R"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Constant,
-                mode: Some(Mode::In),
-                subtype: Subtype::new(right),
-                has_default: false,
-            }),
-            implicit_of.decl_pos(),
-        )));
-
-        Arc::new(NamedEntity::implicit(
-            implicit_of.clone().into(),
-            Designator::OperatorSymbol(op),
-            NamedEntityKind::Subprogram(Signature::new(params, Some(return_type))),
-            implicit_of.decl_pos(),
-        ))
-    }
-
-    fn symmetric_binary(&self, op: Operator, typ: TypeEnt) -> Arc<NamedEntity> {
-        self.binary(op, typ.clone(), typ.clone(), typ.clone(), typ)
-    }
-
-    fn comparison(&self, op: Operator, typ: TypeEnt) -> Arc<NamedEntity> {
-        self.binary(op, typ.clone(), typ.clone(), typ, self.boolean())
-    }
-
-    pub fn minimum(&self, type_ent: TypeEnt) -> Arc<NamedEntity> {
-        self.create_min_or_maximum("MINIMUM", type_ent)
-    }
-
-    pub fn maximum(&self, type_ent: TypeEnt) -> Arc<NamedEntity> {
-        self.create_min_or_maximum("MAXIMUM", type_ent)
+    /// Create implicit function returning string
+    /// function <name> (VALUE: T) return STRING;
+    pub fn to_x_string(&self, name: &str, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.implicit_subpgm(
+            type_ent,
+            self.ident(name),
+            [(
+                self.ident("VALUE"),
+                AnyEntKind::Object(Object::const_param(Subtype::new(type_ent))),
+            )],
+            Some(self.string()),
+        )
+        .into()
     }
 
     /// Create implicit DEALLOCATE
     /// procedure DEALLOCATE (P: inout AT);
-    pub fn deallocate(&self, type_ent: TypeEnt) -> Arc<NamedEntity> {
-        let mut params = FormalRegion::new_params();
-        params.add(Arc::new(NamedEntity::new(
-            self.symbol("P"),
-            NamedEntityKind::Object(Object {
-                class: ObjectClass::Variable,
-                mode: Some(Mode::InOut),
-                subtype: Subtype::new(type_ent.to_owned()),
-                has_default: false,
-            }),
-            type_ent.decl_pos(),
-        )));
-
-        Arc::new(NamedEntity::implicit(
-            type_ent.clone().into(),
-            self.symbol("DEALLOCATE"),
-            NamedEntityKind::Subprogram(Signature::new(params, None)),
-            type_ent.decl_pos(),
-        ))
+    pub fn deallocate(&self, type_ent: TypeEnt<'a>) -> EntRef<'a> {
+        self.implicit_subpgm(
+            type_ent,
+            self.ident("DEALLOCATE"),
+            [(
+                self.ident("P"),
+                AnyEntKind::Object(Object {
+                    class: ObjectClass::Variable,
+                    iface: Some(ObjectInterface::Parameter(Mode::InOut)),
+                    subtype: Subtype::new(type_ent.to_owned()),
+                    has_default: false,
+                }),
+            )],
+            None,
+        )
+        .into()
     }
 
-    pub fn comparators(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn comparison(&self, op: Operator, typ: TypeEnt<'a>) -> EntRef<'a> {
+        self.binary(op, typ, typ, typ, self.boolean())
+    }
+
+    pub fn comparators(&self, typ: TypeEnt<'a>) -> impl Iterator<Item = EntRef<'a>> {
         [
-            self.comparison(Operator::EQ, typ.clone()),
-            self.comparison(Operator::NE, typ.clone()),
-            self.comparison(Operator::LT, typ.clone()),
-            self.comparison(Operator::LTE, typ.clone()),
-            self.comparison(Operator::GT, typ.clone()),
+            self.comparison(Operator::EQ, typ),
+            self.comparison(Operator::NE, typ),
+            self.comparison(Operator::LT, typ),
+            self.comparison(Operator::LTE, typ),
+            self.comparison(Operator::GT, typ),
             self.comparison(Operator::GTE, typ),
         ]
         .into_iter()
     }
 
-    pub fn integer_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn numeric_implicits(
+        &self,
+        kind: UniversalType,
+        typ: TypeEnt<'a>,
+    ) -> impl Iterator<Item = EntRef<'a>> {
+        let integer = self.integer();
+
         [
-            self.minimum(typ.clone()),
-            self.maximum(typ.clone()),
-            self.create_to_string(typ.clone()),
-            self.symmetric_unary(Operator::Minus, typ.clone()),
-            self.symmetric_unary(Operator::Plus, typ.clone()),
-            self.symmetric_unary(Operator::Abs, typ.clone()),
-            self.symmetric_binary(Operator::Plus, typ.clone()),
-            self.symmetric_binary(Operator::Minus, typ.clone()),
+            self.minimum(typ),
+            self.maximum(typ),
+            self.create_to_string(typ),
+            self.symmetric_unary(Operator::Minus, typ),
+            self.symmetric_unary(Operator::Plus, typ),
+            self.symmetric_binary(Operator::Plus, typ),
+            self.symmetric_binary(Operator::Minus, typ),
+            // 9.2.7 Multiplying operators
+            self.symmetric_binary(Operator::Times, typ),
+            self.symmetric_binary(Operator::Div, typ),
+            // 9.2.8 Miscellaneous operators
+            self.symmetric_unary(Operator::Abs, typ),
+            self.binary(Operator::Pow, typ, typ, integer, typ),
         ]
         .into_iter()
-        .chain(self.comparators(typ).into_iter())
+        .chain(
+            if kind == UniversalType::Integer {
+                Some(
+                    [
+                        self.symmetric_binary(Operator::Mod, typ),
+                        self.symmetric_binary(Operator::Rem, typ),
+                    ]
+                    .into_iter(),
+                )
+            } else {
+                None
+            }
+            .into_iter()
+            .flatten(),
+        )
+        .chain(self.comparators(typ))
     }
 
-    pub fn physical_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn universal_implicits(
+        &self,
+        kind: UniversalType,
+        typ: TypeEnt<'a>,
+    ) -> impl Iterator<Item = EntRef<'a>> {
         [
-            self.minimum(typ.clone()),
-            self.maximum(typ.clone()),
-            self.symmetric_unary(Operator::Minus, typ.clone()),
-            self.symmetric_unary(Operator::Plus, typ.clone()),
-            self.symmetric_unary(Operator::Abs, typ.clone()),
-            self.symmetric_binary(Operator::Plus, typ.clone()),
-            self.symmetric_binary(Operator::Minus, typ.clone()),
+            self.minimum(typ),
+            self.maximum(typ),
+            self.create_to_string(typ),
+            self.symmetric_unary(Operator::Minus, typ),
+            self.symmetric_unary(Operator::Plus, typ),
+            self.symmetric_binary(Operator::Plus, typ),
+            self.symmetric_binary(Operator::Minus, typ),
+            // 9.2.7 Multiplying operators
+            self.symmetric_binary(Operator::Times, typ),
+            self.symmetric_binary(Operator::Div, typ),
+            // 9.2.8 Miscellaneous operators
+            self.symmetric_unary(Operator::Abs, typ),
+            self.binary(
+                Operator::Pow,
+                typ,
+                typ,
+                self.universal_integer().into(),
+                typ,
+            ),
         ]
         .into_iter()
-        .chain(self.comparators(typ).into_iter())
+        .chain(
+            if kind == UniversalType::Integer {
+                Some(
+                    [
+                        self.symmetric_binary(Operator::Mod, typ),
+                        self.symmetric_binary(Operator::Rem, typ),
+                    ]
+                    .into_iter(),
+                )
+            } else {
+                None
+            }
+            .into_iter()
+            .flatten(),
+        )
+        .chain(self.comparators(typ))
     }
 
-    pub fn enum_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn physical_implicits(&self, typ: TypeEnt<'a>) -> impl Iterator<Item = EntRef<'a>> {
+        let integer = self.integer();
+        let real = self.real();
+
         [
-            self.create_to_string(typ.clone()),
-            self.minimum(typ.clone()),
-            self.maximum(typ.clone()),
+            self.minimum(typ),
+            self.maximum(typ),
+            self.symmetric_unary(Operator::Minus, typ),
+            self.symmetric_unary(Operator::Plus, typ),
+            self.symmetric_unary(Operator::Abs, typ),
+            self.symmetric_binary(Operator::Plus, typ),
+            self.symmetric_binary(Operator::Minus, typ),
+            // 9.2.7 Multiplying operators
+            self.binary(Operator::Times, typ, typ, integer, typ),
+            self.binary(Operator::Times, typ, typ, real, typ),
+            self.binary(Operator::Times, typ, integer, typ, typ),
+            self.binary(Operator::Times, typ, real, typ, typ),
+            self.binary(Operator::Div, typ, typ, integer, typ),
+            self.binary(Operator::Div, typ, typ, real, typ),
+            self.binary(
+                Operator::Div,
+                typ,
+                typ,
+                typ,
+                self.universal_integer().into(),
+            ),
+            self.symmetric_binary(Operator::Mod, typ),
+            self.symmetric_binary(Operator::Rem, typ),
         ]
         .into_iter()
-        .chain(self.comparators(typ).into_iter())
+        .chain(self.comparators(typ))
     }
 
-    pub fn record_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn enum_implicits(
+        &self,
+        typ: TypeEnt<'a>,
+        matching_op: bool,
+    ) -> impl Iterator<Item = EntRef<'a>> {
         [
-            self.comparison(Operator::EQ, typ.clone()),
+            self.create_to_string(typ),
+            self.minimum(typ),
+            self.maximum(typ),
+        ]
+        .into_iter()
+        .chain(self.comparators(typ))
+        .chain(
+            if matching_op {
+                Some(
+                    [
+                        self.symmetric_binary(Operator::QueEQ, typ),
+                        self.symmetric_binary(Operator::QueNE, typ),
+                        self.symmetric_binary(Operator::QueGT, typ),
+                        self.symmetric_binary(Operator::QueGTE, typ),
+                        self.symmetric_binary(Operator::QueLT, typ),
+                        self.symmetric_binary(Operator::QueLTE, typ),
+                    ]
+                    .into_iter(),
+                )
+            } else {
+                None
+            }
+            .into_iter()
+            .flatten(),
+        )
+    }
+
+    pub fn record_implicits(&self, typ: TypeEnt<'a>) -> impl Iterator<Item = EntRef<'a>> {
+        [
+            self.comparison(Operator::EQ, typ),
             self.comparison(Operator::NE, typ),
         ]
         .into_iter()
     }
 
-    pub fn array_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    fn concatenations(
+        &self,
+        array_type: TypeEnt<'a>,
+        elem_type: TypeEnt<'a>,
+    ) -> impl Iterator<Item = EntRef<'a>> {
         [
-            self.create_to_string(typ.clone()),
-            self.comparison(Operator::EQ, typ.clone()),
-            self.comparison(Operator::NE, typ),
+            self.binary(
+                Operator::Concat,
+                array_type,
+                array_type,
+                elem_type,
+                array_type,
+            ),
+            self.binary(
+                Operator::Concat,
+                array_type,
+                elem_type,
+                array_type,
+                array_type,
+            ),
+            self.symmetric_binary(Operator::Concat, array_type),
+            self.binary(
+                Operator::Concat,
+                array_type,
+                elem_type,
+                elem_type,
+                array_type,
+            ),
         ]
         .into_iter()
     }
 
-    pub fn access_implicits(&self, typ: TypeEnt) -> impl Iterator<Item = Arc<NamedEntity>> {
+    pub fn array_implicits(
+        &self,
+        typ: TypeEnt<'a>,
+        matching_op: bool,
+    ) -> impl Iterator<Item = EntRef<'a>> {
+        let Type::Array{indexes, elem_type, ..}  = typ.kind() else {
+            unreachable!("Must be array type")
+        };
+
+        let is_scalar = matches!(
+            elem_type.base().kind(),
+            Type::Integer | Type::Real | Type::Physical | Type::Enum(_)
+        );
+
+        let is_one_dimensional = indexes.len() == 1;
+        let is_character_elem = matches!(elem_type.base().kind(), Type::Enum(designators) if designators.iter().all(|des| matches!(des, Designator::Character(_))));
+
         [
-            self.deallocate(typ.clone()),
-            self.comparison(Operator::EQ, typ.clone()),
+            self.comparison(Operator::EQ, typ),
+            self.comparison(Operator::NE, typ),
+        ]
+        .into_iter()
+        .chain(if is_one_dimensional && is_character_elem {
+            // To string is only defined for 1d array types with character elements
+            Some(self.create_to_string(typ)).into_iter()
+        } else {
+            None.into_iter()
+        })
+        .chain(
+            (if is_one_dimensional {
+                Some(self.concatenations(typ, *elem_type))
+            } else {
+                None
+            })
+            .into_iter()
+            .flatten(),
+        )
+        .chain(
+            (if is_scalar {
+                Some(
+                    [
+                        self.comparison(Operator::GT, typ),
+                        self.comparison(Operator::GTE, typ),
+                        self.comparison(Operator::LT, typ),
+                        self.comparison(Operator::LTE, typ),
+                        self.elementwise_min_or_maximum("MINIMUM", typ, *elem_type),
+                        self.elementwise_min_or_maximum("MAXIMUM", typ, *elem_type),
+                    ]
+                    .into_iter(),
+                )
+            } else {
+                None
+            })
+            .into_iter()
+            .flatten(),
+        )
+        .chain(
+            if matching_op {
+                Some(
+                    [
+                        self.binary(Operator::QueEQ, typ, typ, typ, *elem_type),
+                        self.binary(Operator::QueNE, typ, typ, typ, *elem_type),
+                        self.binary(Operator::QueGT, typ, typ, typ, *elem_type),
+                        self.binary(Operator::QueGTE, typ, typ, typ, *elem_type),
+                        self.binary(Operator::QueLT, typ, typ, typ, *elem_type),
+                        self.binary(Operator::QueLTE, typ, typ, typ, *elem_type),
+                    ]
+                    .into_iter(),
+                )
+            } else {
+                None
+            }
+            .into_iter()
+            .flatten(),
+        )
+    }
+
+    pub fn access_implicits(&self, typ: TypeEnt<'a>) -> impl Iterator<Item = EntRef<'a>> {
+        [
+            self.deallocate(typ),
+            self.comparison(Operator::EQ, typ),
             self.comparison(Operator::NE, typ),
         ]
         .into_iter()
     }
-
-    // Return the
 
     // Return the implicit things defined at the end of the standard packge
-    pub fn end_of_package_implicits(&self) -> Vec<Arc<NamedEntity>> {
-        let mut res = Vec::new();
+    pub fn end_of_package_implicits(
+        &self,
+        region: &mut Region<'a>,
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) {
+        {
+            let time = self.time();
+            let to_string = self.create_to_string(time);
 
-        for name in [
-            "CHARACTER",
-            "SEVERITY_LEVEL",
-            "FILE_OPEN_KIND",
-            "FILE_OPEN_STATUS",
-        ] {
-            let typ = self.lookup_type(name);
-            for ent in self.enum_implicits(typ.clone()) {
-                if let Some(implicit) = typ.kind().implicits() {
-                    // This is safe because the standard package is analyzed in a single thread
-                    unsafe { implicit.push(&ent) };
-                }
-                res.push(ent);
-            }
+            unsafe {
+                self.arena.add_implicit(time.id(), to_string);
+            };
+            region.add(to_string, diagnostics);
         }
 
-        for name in ["INTEGER", "REAL", "TIME"] {
-            let typ = self.lookup_type(name);
-            for ent in self.integer_implicits(typ.clone()) {
-                if let Some(implicit) = typ.kind().implicits() {
-                    // This is safe because the standard package is analyzed in a single thread
-                    unsafe { implicit.push(&ent) };
-                }
-                res.push(ent);
-            }
-        }
-
-        for name in ["BOOLEAN", "BIT"] {
-            let typ = self.lookup_type(name);
+        for typ in [self.bit(), self.boolean()] {
             let implicits = [
-                self.create_to_string(typ.clone()),
-                self.minimum(typ.clone()),
-                self.maximum(typ.clone()),
-                self.symmetric_binary(Operator::And, typ.clone()),
-                self.symmetric_binary(Operator::Or, typ.clone()),
-                self.symmetric_binary(Operator::Nand, typ.clone()),
-                self.symmetric_binary(Operator::Nor, typ.clone()),
-                self.symmetric_binary(Operator::Xor, typ.clone()),
-                self.symmetric_binary(Operator::Xnor, typ.clone()),
-                self.symmetric_unary(Operator::Not, typ.clone()),
+                self.symmetric_binary(Operator::And, typ),
+                self.symmetric_binary(Operator::Or, typ),
+                self.symmetric_binary(Operator::Nand, typ),
+                self.symmetric_binary(Operator::Nor, typ),
+                self.symmetric_binary(Operator::Xor, typ),
+                self.symmetric_binary(Operator::Xnor, typ),
+                self.symmetric_unary(Operator::Not, typ),
             ]
-            .into_iter()
-            .chain(self.comparators(typ.clone()));
+            .into_iter();
 
             for ent in implicits {
-                if let Some(implicit) = typ.kind().implicits() {
-                    // This is safe because the standard package is analyzed in a single thread
-                    unsafe { implicit.push(&ent) };
-                }
-                res.push(ent);
+                unsafe {
+                    self.arena.add_implicit(typ.id(), ent);
+                };
+                region.add(ent, diagnostics);
             }
         }
 
-        for name in ["BOOLEAN_VECTOR", "BIT_VECTOR"] {
-            let typ = self.lookup_type(name);
-            let return_typ = self.lookup_type(name.strip_suffix("_VECTOR").unwrap());
-            let implicits = [self.unary(Operator::Not, typ.clone(), return_typ.clone())];
-
-            for ent in implicits {
-                if let Some(implicit) = typ.kind().implicits() {
-                    // This is safe because the standard package is analyzed in a single thread
-                    unsafe { implicit.push(&ent) };
-                }
-                res.push(ent);
-            }
-        }
-
-        for name in [
-            "BOOLEAN_VECTOR",
-            "BIT_VECTOR",
-            "INTEGER_VECTOR",
-            "REAL_VECTOR",
-            "TIME_VECTOR",
-            "STRING",
+        for (styp, atyp) in [
+            (self.boolean(), self.boolean_vector()),
+            (self.bit(), self.bit_vector()),
         ] {
-            let typ = self.lookup_type(name);
-            for ent in self.array_implicits(typ.clone()) {
-                if let Some(implicit) = typ.kind().implicits() {
-                    // This is safe because the standard package is analyzed in a single thread
-                    unsafe { implicit.push(&ent) };
-                }
-                res.push(ent);
+            let ops = [
+                Operator::And,
+                Operator::Or,
+                Operator::Nand,
+                Operator::Nor,
+                Operator::Xor,
+                Operator::Xnor,
+                Operator::Not,
+            ];
+
+            let implicits = ops.iter().flat_map(|op| {
+                let op = *op;
+                [
+                    // A op A -> A
+                    self.symmetric_binary(op, atyp),
+                    if op == Operator::Not {
+                        // op A -> A
+                        self.unary(op, atyp, atyp)
+                    } else {
+                        // op A -> S
+                        self.unary(op, atyp, styp)
+                    },
+                    // A op S -> A
+                    self.binary(op, atyp, atyp, styp, atyp),
+                    // S op A -> A
+                    self.binary(op, atyp, styp, atyp, atyp),
+                ]
+                .into_iter()
+            });
+
+            for ent in implicits {
+                // This is safe because the standard package is analyzed in a single thread
+                unsafe {
+                    self.arena.add_implicit(atyp.id(), ent);
+                };
+                region.add(ent, diagnostics);
             }
         }
 
@@ -639,41 +924,29 @@ impl<'a> StandardRegion<'a> {
             let natural = self.natural();
             let string = self.string();
 
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("VALUE"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(real.to_owned()),
-                    has_default: false,
-                }),
-                real.decl_pos(),
-            )));
+            let ent = self
+                .implicit_subpgm(
+                    real,
+                    self.ident("TO_STRING"),
+                    [
+                        (
+                            self.ident("VALUE"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(real))),
+                        ),
+                        (
+                            self.ident("DIGITS"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(natural))),
+                        ),
+                    ],
+                    Some(string),
+                )
+                .into();
 
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("DIGITS"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(natural),
-                    has_default: false,
-                }),
-                real.decl_pos(),
-            )));
-
-            let ent = Arc::new(NamedEntity::implicit(
-                real.clone().into(),
-                self.symbol("TO_STRING"),
-                NamedEntityKind::Subprogram(Signature::new(params, Some(string))),
-                real.decl_pos(),
-            ));
-
-            if let Some(implicit) = real.kind().implicits() {
-                // This is safe because the standard package is analyzed in a single thread
-                unsafe { implicit.push(&ent) };
-            }
-            res.push(ent);
+            // This is safe because the standard package is analyzed in a single thread
+            unsafe {
+                self.arena.add_implicit(real.id(), ent);
+            };
+            region.add(ent, diagnostics);
         }
 
         // function TO_STRING (VALUE: REAL; FORMAT: STRING) return STRING;
@@ -681,83 +954,136 @@ impl<'a> StandardRegion<'a> {
             let real = self.real();
             let string = self.string();
 
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("VALUE"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(real.to_owned()),
-                    has_default: false,
-                }),
-                real.decl_pos(),
-            )));
+            let ent = self
+                .implicit_subpgm(
+                    real,
+                    self.ident("TO_STRING"),
+                    [
+                        (
+                            self.ident("VALUE"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(real))),
+                        ),
+                        (
+                            self.ident("FORMAT"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(string))),
+                        ),
+                    ],
+                    Some(string),
+                )
+                .into();
 
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("FORMAT"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(string.to_owned()),
-                    has_default: false,
-                }),
-                real.decl_pos(),
-            )));
-
-            let ent = Arc::new(NamedEntity::implicit(
-                real.clone().into(),
-                self.symbol("TO_STRING"),
-                NamedEntityKind::Subprogram(Signature::new(params, Some(string))),
-                real.decl_pos(),
-            ));
-
-            if let Some(implicit) = real.kind().implicits() {
-                // This is safe because the standard package is analyzed in a single thread
-                unsafe { implicit.push(&ent) };
-            }
-            res.push(ent);
+            // This is safe because the standard package is analyzed in a single thread
+            unsafe {
+                self.arena.add_implicit(real.id(), ent);
+            };
+            region.add(ent, diagnostics);
         }
 
         // function TO_STRING (VALUE: TIME; UNIT: TIME) return STRING
         {
             let time = self.time();
             let string = self.string();
-            let mut params = FormalRegion::new_params();
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("VALUE"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(time.to_owned()),
-                    has_default: false,
-                }),
-                time.decl_pos(),
-            )));
 
-            params.add(Arc::new(NamedEntity::new(
-                self.symbol("UNIT"),
-                NamedEntityKind::Object(Object {
-                    class: ObjectClass::Constant,
-                    mode: Some(Mode::In),
-                    subtype: Subtype::new(time.to_owned()),
-                    has_default: false,
-                }),
-                time.decl_pos(),
-            )));
+            let ent = self
+                .implicit_subpgm(
+                    time,
+                    self.ident("TO_STRING"),
+                    [
+                        (
+                            self.ident("VALUE"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(time))),
+                        ),
+                        (
+                            self.ident("UNIT"),
+                            AnyEntKind::Object(Object::const_param(Subtype::new(time))),
+                        ),
+                    ],
+                    Some(string),
+                )
+                .into();
 
-            let ent = Arc::new(NamedEntity::implicit(
-                time.clone().into(),
-                self.symbol("TO_STRING"),
-                NamedEntityKind::Subprogram(Signature::new(params, Some(string))),
-                time.decl_pos(),
-            ));
-
-            if let Some(implicit) = time.kind().implicits() {
-                // This is safe because the standard package is analyzed in a single thread
-                unsafe { implicit.push(&ent) };
-            }
-            res.push(ent);
+            // This is safe because the standard package is analyzed in a single thread
+            unsafe {
+                self.arena.add_implicit(time.id(), ent);
+            };
+            region.add(ent, diagnostics);
         }
-        res
+
+        // Special TO_STRING variants for bit-vector
+        {
+            let typ = self.bit_vector();
+            let to_string = typ.implicits.iter().find(|ent| matches!(ent.designator(), Designator::Identifier(ident) if ident.name_utf8() == "TO_STRING")).unwrap();
+
+            let to_bstring = self.arena.alloc(
+                self.ident("TO_BSTRING"),
+                None,
+                Related::ImplicitOf(typ.into()),
+                AnyEntKind::Overloaded(Overloaded::Alias(
+                    OverloadedEnt::from_any(to_string).unwrap(),
+                )),
+                to_string.decl_pos().cloned(),
+            );
+
+            let to_binary_string = self.arena.alloc(
+                self.ident("TO_BINARY_STRING"),
+                None,
+                Related::ImplicitOf(typ.into()),
+                AnyEntKind::Overloaded(Overloaded::Alias(
+                    OverloadedEnt::from_any(to_string).unwrap(),
+                )),
+                to_string.decl_pos().cloned(),
+            );
+
+            let to_ostring = self.to_x_string("TO_OSTRING", typ);
+
+            let to_octal_string = self.arena.alloc(
+                self.ident("TO_OCTAL_STRING"),
+                None,
+                Related::ImplicitOf(typ.into()),
+                AnyEntKind::Overloaded(Overloaded::Alias(
+                    OverloadedEnt::from_any(to_ostring).unwrap(),
+                )),
+                to_string.decl_pos().cloned(),
+            );
+
+            let to_hstring = self.to_x_string("TO_HSTRING", typ);
+            let to_hex_string = self.arena.alloc(
+                self.ident("TO_HEX_STRING"),
+                None,
+                Related::ImplicitOf(typ.into()),
+                AnyEntKind::Overloaded(Overloaded::Alias(
+                    OverloadedEnt::from_any(to_hstring).unwrap(),
+                )),
+                to_string.decl_pos().cloned(),
+            );
+
+            let implicits = [
+                to_bstring,
+                to_binary_string,
+                to_ostring,
+                to_octal_string,
+                to_hstring,
+                to_hex_string,
+            ];
+
+            for ent in implicits {
+                // This is safe because the standard package is analyzed in a single thread
+                unsafe {
+                    self.arena.add_implicit(typ.id(), ent);
+                };
+                region.add(ent, diagnostics);
+            }
+        }
+
+        // ?? operator for bit
+        {
+            let typ = self.bit();
+            let qq = self.unary(Operator::QueQue, typ, self.boolean());
+
+            unsafe {
+                self.arena.add_implicit(typ.id(), qq);
+            };
+            region.add(qq, diagnostics);
+        }
     }
 }

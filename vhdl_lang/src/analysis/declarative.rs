@@ -6,29 +6,27 @@
 
 use super::formal_region::FormalRegion;
 use super::formal_region::RecordRegion;
-use super::implicits::ImplicitVecBuilder;
+use super::named_entity::*;
 use super::names::*;
 use super::*;
 use crate::ast;
 use crate::ast::*;
 use crate::data::*;
 use analyze::*;
-use arc_swap::ArcSwapWeak;
 use fnv::FnvHashMap;
 use named_entity::Signature;
 use region::*;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
 
 impl<'a> AnalyzeContext<'a> {
     pub fn analyze_declarative_part(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         declarations: &mut [Declaration],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        let mut incomplete_types: FnvHashMap<Symbol, (Arc<NamedEntity>, SrcPos)> =
-            FnvHashMap::default();
+    ) -> FatalResult {
+        let mut incomplete_types: FnvHashMap<Symbol, (EntRef<'a>, SrcPos)> = FnvHashMap::default();
 
         for i in 0..declarations.len() {
             // Handle incomplete types
@@ -38,8 +36,6 @@ impl<'a> AnalyzeContext<'a> {
             match decl {
                 Declaration::Type(type_decl) => match type_decl.def {
                     TypeDefinition::Incomplete(ref mut reference) => {
-                        reference.clear_reference();
-
                         match incomplete_types.entry(type_decl.ident.name().clone()) {
                             Entry::Vacant(entry) => {
                                 let full_definiton =
@@ -65,15 +61,16 @@ impl<'a> AnalyzeContext<'a> {
                                     Designator::Identifier(type_decl.ident.name().clone());
 
                                 // Set incomplete type defintion to position of full declaration
-                                let ent = Arc::new(NamedEntity::new(
+                                let ent = self.arena.explicit(
                                     designator,
-                                    NamedEntityKind::Type(Type::Incomplete(ArcSwapWeak::default())),
+                                    parent,
+                                    AnyEntKind::Type(Type::Incomplete),
                                     Some(decl_pos),
-                                ));
-                                reference.set_unique_reference(&ent);
+                                );
+                                reference.set_unique_reference(ent);
 
-                                entry.insert((ent.clone(), type_decl.ident.pos().clone()));
-                                region.add(ent, diagnostics);
+                                entry.insert((ent, type_decl.ident.pos().clone()));
+                                scope.add(ent, diagnostics);
                             }
                             Entry::Occupied(entry) => {
                                 let (_, decl_pos) = entry.get();
@@ -90,32 +87,25 @@ impl<'a> AnalyzeContext<'a> {
                         let incomplete_type = incomplete_types.get(type_decl.ident.name());
                         if let Some((incomplete_type, _)) = incomplete_type {
                             self.analyze_type_declaration(
-                                region,
+                                scope,
+                                parent,
                                 type_decl,
                                 Some(incomplete_type.id()),
                                 diagnostics,
                             )?;
-
-                            // Lookup the newly analyzed type and set it as the full definition of
-                            // the incomplete type
-                            if let Some(NamedEntities::Single(full_type)) =
-                                region.lookup_immediate(incomplete_type.designator())
-                            {
-                                if let NamedEntityKind::Type(Type::Incomplete(full_ref)) =
-                                    incomplete_type.kind()
-                                {
-                                    if full_type.kind().is_type() {
-                                        full_ref.store(Arc::downgrade(full_type));
-                                    }
-                                }
-                            }
                         } else {
-                            self.analyze_type_declaration(region, type_decl, None, diagnostics)?;
+                            self.analyze_type_declaration(
+                                scope,
+                                parent,
+                                type_decl,
+                                None,
+                                diagnostics,
+                            )?;
                         }
                     }
                 },
                 _ => {
-                    self.analyze_declaration(region, &mut declarations[i], diagnostics)?;
+                    self.analyze_declaration(scope, parent, &mut declarations[i], diagnostics)?;
                 }
             }
         }
@@ -124,10 +114,11 @@ impl<'a> AnalyzeContext<'a> {
 
     fn analyze_alias_declaration(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         alias: &mut AliasDeclaration,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalResult<Option<Arc<NamedEntity>>> {
+    ) -> EvalResult<EntRef<'a>> {
         let AliasDeclaration {
             designator,
             name,
@@ -135,135 +126,149 @@ impl<'a> AnalyzeContext<'a> {
             signature,
         } = alias;
 
-        let resolved_name = self.resolve_object_prefix(
-            region,
-            &name.pos,
-            &mut name.item,
-            "Invalid alias name",
-            diagnostics,
-        );
+        let resolved_name = self.name_resolve(scope, &name.pos, &mut name.item, diagnostics);
 
         if let Some(ref mut subtype_indication) = subtype_indication {
             // Object alias
-            self.analyze_subtype_indication(region, subtype_indication, diagnostics)?;
+            self.analyze_subtype_indication(scope, subtype_indication, diagnostics)?;
         }
 
-        let resolved_name = match resolved_name {
-            Ok(resolved_name) => resolved_name,
-            Err(err) => {
-                err.add_to(diagnostics)?;
-                return Ok(None);
-            }
-        };
+        let resolved_name = resolved_name?;
 
         let kind = {
             match resolved_name {
-                ResolvedName::ObjectSelection {
-                    base_object,
-                    type_mark,
-                } => {
+                ResolvedName::ObjectName(oname) => {
                     if let Some(ref signature) = signature {
-                        diagnostics.push(signature_error(signature));
+                        diagnostics.push(Diagnostic::should_not_have_signature("Alias", signature));
                     }
-                    NamedEntityKind::ObjectAlias {
-                        base_object,
-                        type_mark,
+                    match oname.base {
+                        ObjectBase::Object(base_object) => AnyEntKind::ObjectAlias {
+                            base_object,
+                            type_mark: oname.type_mark(),
+                        },
+                        ObjectBase::ObjectAlias(base_object, _) => AnyEntKind::ObjectAlias {
+                            base_object,
+                            type_mark: oname.type_mark(),
+                        },
+                        ObjectBase::ExternalName(class) => AnyEntKind::ExternalAlias {
+                            class,
+                            type_mark: oname.type_mark(),
+                        },
+                        ObjectBase::DeferredConstant(_) => {
+                            // @TODO handle
+                            return Err(EvalError::Unknown);
+                        }
                     }
                 }
-                ResolvedName::ExternalName { class, type_mark } => {
+                ResolvedName::Library(_)
+                | ResolvedName::Design(_)
+                | ResolvedName::Expression(_) => {
                     if let Some(ref signature) = signature {
-                        diagnostics.push(signature_error(signature));
+                        diagnostics.push(Diagnostic::should_not_have_signature("Alias", signature));
                     }
-                    NamedEntityKind::ExternalAlias { class, type_mark }
-                }
-                ResolvedName::NonObject(ent) => {
-                    if let Some(ref signature) = signature {
-                        diagnostics.push(signature_error(signature));
-                    }
-                    NamedEntityKind::NonObjectAlias(ent)
+                    diagnostics.error(
+                        &name.pos,
+                        format!("{} cannot be aliased", resolved_name.describe_type()),
+                    );
+                    return Err(EvalError::Unknown);
                 }
                 ResolvedName::Type(typ) => {
                     if let Some(ref signature) = signature {
-                        diagnostics.push(signature_error(signature));
+                        diagnostics.push(Diagnostic::should_not_have_signature("Alias", signature));
                     }
-                    NamedEntityKind::Type(Type::Alias(typ))
+                    AnyEntKind::Type(Type::Alias(typ))
                 }
-                ResolvedName::Overloaded(overloaded) => {
+                ResolvedName::Overloaded(des, overloaded) => {
                     if let Some(ref mut signature) = signature {
-                        match self.resolve_signature(region, signature) {
+                        match self.resolve_signature(scope, signature) {
                             Ok(signature_key) => {
                                 if let Some(ent) = overloaded.get(&signature_key) {
                                     if let Some(reference) = name.item.suffix_reference_mut() {
-                                        reference.set_unique_reference(ent.inner());
+                                        reference.set_unique_reference(&ent);
                                     }
-                                    NamedEntityKind::NonObjectAlias(ent.into())
+                                    AnyEntKind::Overloaded(Overloaded::Alias(ent))
                                 } else {
-                                    let mut diagnostic = Diagnostic::error(
-                                        name,
-                                        "Could not find declaration with given signature",
-                                    );
-                                    for ent in overloaded.entities() {
-                                        if let Some(pos) = ent.decl_pos() {
-                                            diagnostic.add_related(
-                                                pos,
-                                                format!("Found {}", ent.describe()),
-                                            );
-                                        }
-                                    }
-                                    diagnostics.push(diagnostic);
-                                    return Ok(None);
+                                    diagnostics.push(Diagnostic::no_overloaded_with_signature(
+                                        &des.pos,
+                                        &des.item,
+                                        &overloaded,
+                                    ));
+                                    return Err(EvalError::Unknown);
                                 }
                             }
                             Err(err) => {
                                 err.add_to(diagnostics)?;
-                                return Ok(None);
+                                return Err(EvalError::Unknown);
                             }
                         }
                     } else {
-                        diagnostics.error(
-                            name,
-                            "Signature required for alias of subprogram and enum literals",
-                        );
-                        return Ok(None);
+                        diagnostics.push(Diagnostic::signature_required(name));
+                        return Err(EvalError::Unknown);
                     }
+                }
+                ResolvedName::Final(_) => {
+                    // @TODO some of these can probably be aliased
+                    return Err(EvalError::Unknown);
                 }
             }
         };
 
-        Ok(Some(designator.define(kind)))
+        Ok(designator.define(self.arena, parent, kind))
     }
 
-    fn analyze_declaration(
+    pub(crate) fn analyze_declaration(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         decl: &mut Declaration,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         match decl {
             Declaration::Alias(alias) => {
-                if let Some(ent) = self.analyze_alias_declaration(region, alias, diagnostics)? {
-                    region.add(ent.clone(), diagnostics);
-                    region.add_implicit_declaration_aliases(ent, diagnostics);
+                if let Some(ent) =
+                    as_fatal(self.analyze_alias_declaration(scope, parent, alias, diagnostics))?
+                {
+                    scope.add(ent, diagnostics);
+
+                    for implicit in ent.as_actual().implicits.iter() {
+                        match OverloadedEnt::from_any(implicit) {
+                            Some(implicit) => {
+                                let impicit_alias = self.arena.implicit(
+                                    ent,
+                                    implicit.designator().clone(),
+                                    AnyEntKind::Overloaded(Overloaded::Alias(implicit)),
+                                    ent.decl_pos(),
+                                );
+                                scope.add(impicit_alias, diagnostics);
+                            }
+                            None => {
+                                eprintln!(
+                                    "Expect implicit declaration to be overloaded, got: {}",
+                                    implicit.describe()
+                                )
+                            }
+                        }
+                    }
                 }
             }
             Declaration::Object(ref mut object_decl) => {
                 let subtype = self.resolve_subtype_indication(
-                    region,
+                    scope,
                     &mut object_decl.subtype_indication,
                     diagnostics,
                 );
 
                 if let Some(ref mut expr) = object_decl.expression {
                     if let Ok(ref subtype) = subtype {
-                        self.analyze_expression_with_target_type(
-                            region,
+                        self.expr_pos_with_ttyp(
+                            scope,
                             subtype.type_mark(),
                             &expr.pos,
                             &mut expr.item,
                             diagnostics,
                         )?;
                     } else {
-                        self.analyze_expression(region, expr, diagnostics)?;
+                        self.expr_unknown_ttyp(scope, expr, diagnostics)?;
                     }
                 }
 
@@ -272,16 +277,41 @@ impl<'a> AnalyzeContext<'a> {
                         let kind = if object_decl.class == ObjectClass::Constant
                             && object_decl.expression.is_none()
                         {
-                            NamedEntityKind::DeferredConstant(subtype)
+                            AnyEntKind::DeferredConstant(subtype)
                         } else {
-                            NamedEntityKind::Object(Object {
+                            AnyEntKind::Object(Object {
                                 class: object_decl.class,
-                                mode: None,
+                                iface: None,
                                 has_default: object_decl.expression.is_some(),
                                 subtype,
                             })
                         };
-                        region.add(object_decl.ident.define(kind), diagnostics);
+
+                        let declared_by = if object_decl.class == ObjectClass::Constant
+                            && object_decl.expression.is_some()
+                        {
+                            self.find_deferred_constant_declaration(
+                                scope,
+                                &object_decl.ident.tree.item,
+                            )
+                        } else {
+                            None
+                        };
+
+                        let object_ent = self.arena.alloc(
+                            object_decl.ident.tree.item.clone().into(),
+                            Some(parent),
+                            if let Some(declared_by) = declared_by {
+                                Related::DeclaredBy(declared_by)
+                            } else {
+                                Related::None
+                            },
+                            kind,
+                            Some(object_decl.ident.tree.pos().clone()),
+                        );
+                        object_decl.ident.decl = Some(object_ent.id());
+
+                        scope.add(object_ent, diagnostics);
                     }
                     Err(err) => err.add_to(diagnostics)?,
                 }
@@ -294,130 +324,233 @@ impl<'a> AnalyzeContext<'a> {
                     file_name,
                 } = file;
 
-                let subtype = match self.resolve_subtype_indication(
-                    region,
-                    subtype_indication,
-                    diagnostics,
-                ) {
-                    Ok(subtype) => Some(subtype),
-                    Err(err) => {
-                        err.add_to(diagnostics)?;
-                        None
-                    }
-                };
+                let subtype =
+                    match self.resolve_subtype_indication(scope, subtype_indication, diagnostics) {
+                        Ok(subtype) => Some(subtype),
+                        Err(err) => {
+                            err.add_to(diagnostics)?;
+                            None
+                        }
+                    };
 
                 if let Some(ref mut expr) = open_info {
-                    self.analyze_expression(region, expr, diagnostics)?;
+                    self.expr_unknown_ttyp(scope, expr, diagnostics)?;
                 }
                 if let Some(ref mut expr) = file_name {
-                    self.analyze_expression(region, expr, diagnostics)?;
+                    self.expr_unknown_ttyp(scope, expr, diagnostics)?;
                 }
 
                 if let Some(subtype) = subtype {
-                    region.add(ident.define(NamedEntityKind::File(subtype)), diagnostics);
-                }
-            }
-            Declaration::Component(ref mut component) => {
-                let mut component_region = region.nested();
-                self.analyze_interface_list(
-                    &mut component_region,
-                    &mut component.generic_list,
-                    diagnostics,
-                )?;
-                self.analyze_interface_list(
-                    &mut component_region,
-                    &mut component.port_list,
-                    diagnostics,
-                )?;
-                component_region.close(diagnostics);
-                region.add(
-                    component.ident.define(NamedEntityKind::Component(
-                        component_region.without_parent(),
-                    )),
-                    diagnostics,
-                );
-            }
-            Declaration::Attribute(ref mut attr) => match attr {
-                Attribute::Declaration(ref mut attr_decl) => {
-                    if let Err(err) = self.resolve_type_mark(region, &mut attr_decl.type_mark) {
-                        err.add_to(diagnostics)?;
-                    }
-                    region.add(
-                        attr_decl.ident.define(NamedEntityKind::Attribute),
+                    scope.add(
+                        self.arena.define(ident, parent, AnyEntKind::File(subtype)),
                         diagnostics,
                     );
                 }
-                // @TODO Ignored for now
-                Attribute::Specification(..) => {}
+            }
+            Declaration::Component(ref mut component) => {
+                let nested = scope.nested();
+                let ent = self.arena.define(
+                    &mut component.ident,
+                    parent,
+                    AnyEntKind::Component(Region::default()),
+                );
+                self.analyze_interface_list(
+                    &nested,
+                    ent,
+                    &mut component.generic_list,
+                    diagnostics,
+                )?;
+                self.analyze_interface_list(&nested, ent, &mut component.port_list, diagnostics)?;
+
+                let kind = AnyEntKind::Component(nested.into_region());
+                unsafe {
+                    ent.set_kind(kind);
+                }
+
+                scope.add(ent, diagnostics);
+            }
+            Declaration::Attribute(ref mut attr) => match attr {
+                Attribute::Declaration(ref mut attr_decl) => {
+                    match self.resolve_type_mark(scope, &mut attr_decl.type_mark) {
+                        Ok(typ) => {
+                            scope.add(
+                                self.arena.define(
+                                    &mut attr_decl.ident,
+                                    parent,
+                                    AnyEntKind::Attribute(typ),
+                                ),
+                                diagnostics,
+                            );
+                        }
+                        Err(err) => {
+                            err.add_to(diagnostics)?;
+                        }
+                    }
+                }
+                Attribute::Specification(ref mut attr_spec) => {
+                    let AttributeSpecification {
+                        ident,
+                        entity_name,
+                        // @TODO also check the entity class
+                        entity_class: _,
+                        expr,
+                    } = attr_spec;
+
+                    match scope.lookup(
+                        &ident.item.pos,
+                        &Designator::Identifier(ident.item.name().clone()),
+                    ) {
+                        Ok(NamedEntities::Single(ent)) => {
+                            ident.set_unique_reference(ent);
+                            if let AnyEntKind::Attribute(typ) = ent.actual_kind() {
+                                self.expr_pos_with_ttyp(
+                                    scope,
+                                    *typ,
+                                    &expr.pos,
+                                    &mut expr.item,
+                                    diagnostics,
+                                )?;
+                            } else {
+                                diagnostics.error(
+                                    &ident.item.pos,
+                                    format!("{} is not an attribute", ent.describe()),
+                                );
+                            }
+                        }
+                        Ok(NamedEntities::Overloaded(_)) => {
+                            diagnostics.error(
+                                &ident.item.pos,
+                                format!("Overloaded name '{}' is not an attribute", ident.item),
+                            );
+                        }
+                        Err(err) => {
+                            diagnostics.push(err);
+                        }
+                    }
+
+                    if let EntityName::Name(EntityTag {
+                        designator,
+                        signature,
+                    }) = entity_name
+                    {
+                        match scope.lookup(&designator.pos, &designator.item.item) {
+                            Ok(NamedEntities::Single(ent)) => {
+                                designator.set_unique_reference(ent);
+
+                                if let Some(signature) = signature {
+                                    diagnostics.push(Diagnostic::should_not_have_signature(
+                                        "Attribute specification",
+                                        &signature.pos,
+                                    ));
+                                }
+                            }
+                            Ok(NamedEntities::Overloaded(overloaded)) => {
+                                if let Some(signature) = signature {
+                                    match self.resolve_signature(scope, signature) {
+                                        Ok(signature_key) => {
+                                            if let Some(ent) = overloaded.get(&signature_key) {
+                                                designator.set_unique_reference(&ent);
+                                            } else {
+                                                diagnostics.push(
+                                                    Diagnostic::no_overloaded_with_signature(
+                                                        &designator.pos,
+                                                        &designator.item.item,
+                                                        &overloaded,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            err.add_to(diagnostics)?;
+                                        }
+                                    }
+                                } else if let Some(ent) = overloaded.as_unique() {
+                                    designator.set_unique_reference(ent);
+                                } else {
+                                    diagnostics.push(Diagnostic::signature_required(designator));
+                                }
+                            }
+                            Err(err) => {
+                                diagnostics.push(err);
+                            }
+                        }
+                    }
+                }
             },
             Declaration::SubprogramBody(ref mut body) => {
-                let mut subpgm_region = region.nested();
-
-                let signature = self.analyze_subprogram_declaration(
-                    &mut subpgm_region,
+                let (subpgm_region, subpgm_ent) = match self.subprogram_declaration(
+                    scope,
+                    parent,
                     &mut body.specification,
+                    Overloaded::Subprogram,
                     diagnostics,
-                );
-
-                // End mutable borrow of parent
-                let subpgm_region = subpgm_region.without_parent();
-
-                // Overwrite subprogram definition with full signature
-                match signature {
-                    Ok(signature) => {
-                        let subpgm_ent = body
-                            .specification
-                            .define(NamedEntityKind::Subprogram(signature));
-                        region.add(subpgm_ent, diagnostics);
+                ) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        diagnostics.push(err.into_non_fatal()?);
+                        return Ok(());
                     }
-                    Err(err) => err.add_to(diagnostics)?,
-                }
-                let mut subpgm_region = subpgm_region.with_parent(region);
+                };
 
+                scope.add(subpgm_ent.into(), diagnostics);
+
+                self.define_labels_for_sequential_part(
+                    &subpgm_region,
+                    subpgm_ent.into(),
+                    &mut body.statements,
+                    diagnostics,
+                )?;
                 self.analyze_declarative_part(
-                    &mut subpgm_region,
+                    &subpgm_region,
+                    subpgm_ent.into(),
                     &mut body.declarations,
                     diagnostics,
                 )?;
-                subpgm_region.close(diagnostics);
 
                 self.analyze_sequential_part(
-                    &mut subpgm_region,
+                    &subpgm_region,
+                    subpgm_ent.into(),
                     &mut body.statements,
                     diagnostics,
                 )?;
             }
             Declaration::SubprogramDeclaration(ref mut subdecl) => {
-                let mut subpgm_region = region.nested();
-                let signature =
-                    self.analyze_subprogram_declaration(&mut subpgm_region, subdecl, diagnostics);
-                subpgm_region.close(diagnostics);
-                drop(subpgm_region);
-
-                match signature {
-                    Ok(signature) => {
-                        region.add(
-                            subdecl.define(NamedEntityKind::SubprogramDecl(signature)),
-                            diagnostics,
-                        );
+                match self.subprogram_declaration(
+                    scope,
+                    parent,
+                    subdecl,
+                    Overloaded::SubprogramDecl,
+                    diagnostics,
+                ) {
+                    Ok((_, ent)) => {
+                        scope.add(ent.into(), diagnostics);
                     }
-                    Err(err) => err.add_to(diagnostics)?,
+                    Err(err) => {
+                        diagnostics.push(err.into_non_fatal()?);
+                        return Ok(());
+                    }
                 }
             }
 
             Declaration::Use(ref mut use_clause) => {
-                self.analyze_use_clause(region, &mut use_clause.item, diagnostics)?;
+                self.analyze_use_clause(scope, &mut use_clause.item, diagnostics)?;
             }
 
             Declaration::Package(ref mut instance) => {
-                match self.analyze_package_instance_name(region, &mut instance.package_name) {
-                    Ok(package_region) => region.add(
-                        instance
-                            .ident
-                            .define(NamedEntityKind::LocalPackageInstance(package_region)),
-                        diagnostics,
-                    ),
-                    Err(err) => err.add_to(diagnostics)?,
+                let ent = self.arena.define(
+                    &mut instance.ident,
+                    parent,
+                    AnyEntKind::Design(Design::PackageInstance(Region::default())),
+                );
+
+                if let Some(pkg_region) =
+                    as_fatal(self.generic_package_instance(scope, ent, instance, diagnostics))?
+                {
+                    let kind = AnyEntKind::Design(Design::PackageInstance(pkg_region));
+                    unsafe {
+                        ent.set_kind(kind);
+                    }
+                    scope.add(ent, diagnostics);
                 }
             }
             Declaration::Configuration(..) => {}
@@ -427,23 +560,56 @@ impl<'a> AnalyzeContext<'a> {
         Ok(())
     }
 
-    fn analyze_type_declaration(
+    fn find_subpgm_declaration(
         &self,
-        parent: &mut Region<'_>,
+        scope: &Scope<'a>,
+        decl: &SubprogramDeclaration,
+        signature: &Signature,
+    ) -> Option<OverloadedEnt<'a>> {
+        let des = decl.subpgm_designator().item.clone().into_designator();
+
+        if let Some(NamedEntities::Overloaded(overloaded)) = scope.lookup_immediate(&des) {
+            let ent = overloaded.get(&signature.key())?;
+
+            if ent.is_subprogram_decl() {
+                return Some(ent);
+            }
+        }
+        None
+    }
+
+    fn find_deferred_constant_declaration(
+        &self,
+        scope: &Scope<'a>,
+        ident: &Symbol,
+    ) -> Option<EntRef<'a>> {
+        if let Some(NamedEntities::Single(ent)) = scope.lookup_immediate(&ident.into()) {
+            if ent.kind().is_deferred_constant() {
+                return Some(ent);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn analyze_type_declaration(
+        &self,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         type_decl: &mut TypeDeclaration,
         // Is the full type declaration of an incomplete type
         // Overwrite id when defining full type
         overwrite_id: Option<EntityId>,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         match type_decl.def {
             TypeDefinition::Enumeration(ref mut enumeration) => {
-                let implicit = ImplicitVecBuilder::default();
                 let enum_type = TypeEnt::define_with_opt_id(
+                    self.arena,
                     overwrite_id,
                     &mut type_decl.ident,
+                    parent,
+                    None,
                     Type::Enum(
-                        implicit.inner(),
                         enumeration
                             .iter()
                             .map(|literal| literal.tree.item.clone().into_designator())
@@ -451,52 +617,78 @@ impl<'a> AnalyzeContext<'a> {
                     ),
                 );
 
-                let signature = Signature::new(
-                    FormalRegion::new(InterfaceListType::Parameter),
-                    Some(enum_type.clone()),
-                );
+                let signature =
+                    Signature::new(FormalRegion::new(InterfaceType::Parameter), Some(enum_type));
 
                 for literal in enumeration.iter_mut() {
-                    let literal_ent = Arc::new(NamedEntity::new(
+                    let literal_ent = self.arena.explicit(
                         literal.tree.item.clone().into_designator(),
-                        NamedEntityKind::EnumLiteral(signature.clone()),
+                        enum_type.into(),
+                        AnyEntKind::Overloaded(Overloaded::EnumLiteral(signature.clone())),
                         Some(&literal.tree.pos),
-                    ));
-                    literal.decl = Some(literal_ent.clone());
-                    implicit.push(&literal_ent);
-                    parent.add(literal_ent, diagnostics);
+                    );
+                    literal.decl = Some(literal_ent.id());
+
+                    unsafe {
+                        self.arena.add_implicit(enum_type.id(), literal_ent);
+                    }
+
+                    scope.add(literal_ent, diagnostics);
                 }
 
-                parent.add(enum_type.clone().into(), diagnostics);
+                scope.add(enum_type.into(), diagnostics);
 
-                if let Some(standard) = self.standard_package() {
-                    for ent in standard.enum_implicits(enum_type) {
-                        implicit.push(&ent);
-                        parent.add(ent, diagnostics);
+                for ent in self.enum_implicits(enum_type, self.has_matching_op(enum_type)) {
+                    unsafe {
+                        self.arena.add_implicit(enum_type.id(), ent);
                     }
+
+                    scope.add(ent, diagnostics);
                 }
             }
             TypeDefinition::ProtectedBody(ref mut body) => {
-                body.type_reference.clear_reference();
-
-                match parent.lookup_immediate(&type_decl.ident.tree.item.clone().into()) {
+                match scope.lookup_immediate(&type_decl.ident.tree.item.clone().into()) {
                     Some(visible) => {
                         let is_ok = match visible.clone().into_non_overloaded() {
                             Ok(ent) => {
-                                if let NamedEntityKind::Type(Type::Protected(ptype_region)) =
+                                if let AnyEntKind::Type(Type::Protected(ptype_region, is_body)) =
                                     ent.kind()
                                 {
-                                    body.type_reference.set_unique_reference(&ent);
-                                    let mut region = Region::extend(ptype_region, Some(parent));
-                                    self.analyze_declarative_part(
-                                        &mut region,
-                                        &mut body.decl,
-                                        diagnostics,
-                                    )?;
-                                    parent.add_protected_body(
-                                        type_decl.ident.tree.clone(),
-                                        diagnostics,
-                                    );
+                                    if *is_body {
+                                        if let Some(prev_pos) = ent.decl_pos() {
+                                            diagnostics.push(duplicate_error(
+                                                &type_decl.ident.tree,
+                                                &type_decl.ident.tree.pos,
+                                                Some(prev_pos),
+                                            ))
+                                        }
+                                    } else {
+                                        let ptype_body: &'a AnyEnt = TypeEnt::define_with_opt_id(
+                                            self.arena,
+                                            overwrite_id,
+                                            &mut type_decl.ident,
+                                            parent,
+                                            Some(ent),
+                                            Type::Protected(Region::default(), true),
+                                        )
+                                        .into();
+
+                                        let region = Scope::extend(ptype_region, Some(scope));
+                                        self.analyze_declarative_part(
+                                            &region,
+                                            ptype_body,
+                                            &mut body.decl,
+                                            diagnostics,
+                                        )?;
+
+                                        let kind = Type::Protected(region.into_region(), true);
+                                        unsafe {
+                                            ptype_body.set_kind(AnyEntKind::Type(kind));
+                                        }
+
+                                        scope.add(ptype_body, diagnostics);
+                                    }
+
                                     true
                                 } else {
                                     false
@@ -523,69 +715,79 @@ impl<'a> AnalyzeContext<'a> {
             TypeDefinition::Protected(ref mut prot_decl) => {
                 // Protected type name is visible inside its declarative region
                 // This will be overwritten later when the protected type region is finished
-                // @TODO mutate region
-                let ptype: Arc<NamedEntity> = TypeEnt::define_with_opt_id(
+                let ptype: &'a AnyEnt = TypeEnt::define_with_opt_id(
+                    self.arena,
                     overwrite_id,
                     &mut type_decl.ident,
-                    Type::Protected(Arc::new(Region::default())),
+                    parent,
+                    None,
+                    Type::Protected(Region::default(), false),
                 )
                 .into();
-                parent.add(ptype.clone(), diagnostics);
 
-                let mut region = parent.nested();
+                scope.add(ptype, diagnostics);
+
+                let region = scope.nested();
                 for item in prot_decl.items.iter_mut() {
                     match item {
                         ProtectedTypeDeclarativeItem::Subprogram(ref mut subprogram) => {
-                            let mut subpgm_region = region.nested();
-                            let signature = self.analyze_subprogram_declaration(
-                                &mut subpgm_region,
+                            match self.subprogram_declaration(
+                                scope,
+                                ptype,
                                 subprogram,
+                                Overloaded::SubprogramDecl,
                                 diagnostics,
-                            );
-                            subpgm_region.close(diagnostics);
-                            drop(subpgm_region);
-
-                            match signature {
-                                Ok(signature) => {
-                                    region.add(
-                                        subprogram
-                                            .define(NamedEntityKind::SubprogramDecl(signature)),
-                                        diagnostics,
-                                    );
+                            ) {
+                                Ok((_, ent)) => {
+                                    region.add(ent.into(), diagnostics);
                                 }
                                 Err(err) => {
-                                    err.add_to(diagnostics)?;
+                                    diagnostics.push(err.into_non_fatal()?);
+                                    return Ok(());
                                 }
                             }
                         }
                     }
                 }
-                let region = region.without_parent();
 
-                parent.add(
-                    Arc::new(
-                        ptype.clone_with_kind(NamedEntityKind::Type(Type::Protected(Arc::new(
-                            region,
-                        )))),
-                    ),
-                    &mut Vec::new(),
-                );
+                // This is safe since we are in a single thread and no other reference can exist yes
+                // Also the region is stored inside an Arc which cannot move
+                {
+                    let AnyEntKind::Type(Type::Protected(region_ptr, _)) = ptype.kind() else {
+                        unreachable!();
+                    };
+
+                    let region_ptr = unsafe {
+                        let region_ptr = region_ptr as *const Region;
+                        let region_ptr = region_ptr as *mut Region;
+                        &mut *region_ptr as &mut Region
+                    };
+                    *region_ptr = region.into_region();
+                }
             }
             TypeDefinition::Record(ref mut element_decls) => {
+                let type_ent = TypeEnt::define_with_opt_id(
+                    self.arena,
+                    overwrite_id,
+                    &mut type_decl.ident,
+                    parent,
+                    None,
+                    Type::Record(RecordRegion::default()),
+                );
+
                 let mut elems = RecordRegion::default();
                 let mut region = Region::default();
                 for elem_decl in element_decls.iter_mut() {
-                    let subtype = self.resolve_subtype_indication(
-                        parent,
-                        &mut elem_decl.subtype,
-                        diagnostics,
-                    );
+                    let subtype =
+                        self.resolve_subtype_indication(scope, &mut elem_decl.subtype, diagnostics);
                     match subtype {
                         Ok(subtype) => {
-                            let elem = elem_decl
-                                .ident
-                                .define(NamedEntityKind::ElementDeclaration(subtype));
-                            region.add(elem.clone(), diagnostics);
+                            let elem = self.arena.define(
+                                &mut elem_decl.ident,
+                                type_ent.into(),
+                                AnyEntKind::ElementDeclaration(subtype),
+                            );
+                            region.add(elem, diagnostics);
                             elems.add(elem);
                         }
                         Err(err) => {
@@ -595,92 +797,97 @@ impl<'a> AnalyzeContext<'a> {
                 }
                 region.close(diagnostics);
 
-                let implicit = ImplicitVecBuilder::default();
-                let type_ent = TypeEnt::define_with_opt_id(
-                    overwrite_id,
-                    &mut type_decl.ident,
-                    Type::Record(elems, implicit.inner()),
-                );
-                parent.add(type_ent.clone().into(), diagnostics);
+                unsafe {
+                    let kind = AnyEntKind::Type(Type::Record(elems));
+                    type_ent.set_kind(kind)
+                }
 
-                if let Some(standard) = self.standard_package() {
-                    for ent in standard.record_implicits(type_ent) {
-                        implicit.push(&ent);
-                        parent.add(ent, diagnostics);
+                scope.add(type_ent.into(), diagnostics);
+
+                for ent in self.record_implicits(type_ent) {
+                    unsafe {
+                        self.arena.add_implicit(type_ent.id(), ent);
                     }
+                    scope.add(ent, diagnostics);
                 }
             }
             TypeDefinition::Access(ref mut subtype_indication) => {
                 let subtype =
-                    self.resolve_subtype_indication(parent, subtype_indication, diagnostics);
+                    self.resolve_subtype_indication(scope, subtype_indication, diagnostics);
                 match subtype {
                     Ok(subtype) => {
-                        let implicit = ImplicitVecBuilder::default();
                         let type_ent = TypeEnt::define_with_opt_id(
+                            self.arena,
                             overwrite_id,
                             &mut type_decl.ident,
-                            Type::Access(subtype, implicit.inner()),
+                            parent,
+                            None,
+                            Type::Access(subtype),
                         );
 
-                        parent.add(type_ent.clone().into(), diagnostics);
+                        scope.add(type_ent.into(), diagnostics);
 
-                        if let Some(standard) = self.standard_package() {
-                            for ent in standard.access_implicits(type_ent) {
-                                implicit.push(&ent);
-                                parent.add(ent, diagnostics);
+                        for ent in self.access_implicits(type_ent) {
+                            unsafe {
+                                self.arena.add_implicit(type_ent.id(), ent);
                             }
+                            scope.add(ent, diagnostics);
                         }
                     }
                     Err(err) => err.add_to(diagnostics)?,
                 }
             }
             TypeDefinition::Array(ref mut array_indexes, ref mut subtype_indication) => {
-                let mut indexes: Vec<Option<TypeEnt>> = Vec::with_capacity(array_indexes.len());
+                let mut indexes: Vec<Option<BaseType>> = Vec::with_capacity(array_indexes.len());
                 for index in array_indexes.iter_mut() {
-                    indexes.push(self.analyze_array_index(parent, index, diagnostics)?);
+                    indexes.push(as_fatal(self.analyze_array_index(
+                        scope,
+                        index,
+                        diagnostics,
+                    ))?);
                 }
 
-                let elem_type = match self.resolve_subtype_indication(
-                    parent,
-                    subtype_indication,
-                    diagnostics,
-                ) {
-                    Ok(subtype) => subtype.type_mark().to_owned(),
-                    Err(err) => {
-                        err.add_to(diagnostics)?;
-                        return Ok(());
-                    }
-                };
+                let elem_type =
+                    match self.resolve_subtype_indication(scope, subtype_indication, diagnostics) {
+                        Ok(subtype) => subtype.type_mark().to_owned(),
+                        Err(err) => {
+                            err.add_to(diagnostics)?;
+                            return Ok(());
+                        }
+                    };
 
-                let implicits = ImplicitVecBuilder::default();
+                let is_1d = indexes.len() == 1;
                 let array_ent = TypeEnt::define_with_opt_id(
+                    self.arena,
                     overwrite_id,
                     &mut type_decl.ident,
-                    Type::Array {
-                        implicit: implicits.inner(),
-                        indexes,
-                        elem_type,
-                    },
+                    parent,
+                    None,
+                    Type::Array { indexes, elem_type },
                 );
 
-                parent.add(array_ent.clone().into(), diagnostics);
+                scope.add(array_ent.into(), diagnostics);
 
-                if let Some(standard) = self.standard_package() {
-                    for ent in standard.array_implicits(array_ent) {
-                        implicits.push(&ent);
-                        parent.add(ent, diagnostics);
+                for ent in self.array_implicits(array_ent, is_1d && self.has_matching_op(elem_type))
+                {
+                    unsafe {
+                        self.arena.add_implicit(array_ent.id(), ent);
                     }
+                    scope.add(ent, diagnostics);
                 }
             }
             TypeDefinition::Subtype(ref mut subtype_indication) => {
-                match self.resolve_subtype_indication(parent, subtype_indication, diagnostics) {
+                match self.resolve_subtype_indication(scope, subtype_indication, diagnostics) {
                     Ok(subtype) => {
                         let type_ent = TypeEnt::define_with_opt_id(
+                            self.arena,
                             overwrite_id,
                             &mut type_decl.ident,
+                            parent,
+                            None,
                             Type::Subtype(subtype),
                         );
-                        parent.add(type_ent.into(), diagnostics);
+                        scope.add(type_ent.into(), diagnostics);
                     }
                     Err(err) => {
                         err.add_to(diagnostics)?;
@@ -688,26 +895,38 @@ impl<'a> AnalyzeContext<'a> {
                 }
             }
             TypeDefinition::Physical(ref mut physical) => {
-                let implicits = ImplicitVecBuilder::default();
+                self.range_with_ttyp(
+                    scope,
+                    self.universal_integer().into(),
+                    &mut physical.range,
+                    diagnostics,
+                )?;
 
                 let phys_type = TypeEnt::define_with_opt_id(
+                    self.arena,
                     overwrite_id,
                     &mut type_decl.ident,
-                    Type::Physical(implicits.inner()),
+                    parent,
+                    None,
+                    Type::Physical,
                 );
-                parent.add(phys_type.clone().into(), diagnostics);
+                scope.add(phys_type.into(), diagnostics);
 
-                let primary = physical
-                    .primary_unit
-                    .define(NamedEntityKind::PhysicalLiteral(phys_type.clone()));
+                let primary = self.arena.define(
+                    &mut physical.primary_unit,
+                    parent,
+                    AnyEntKind::PhysicalLiteral(phys_type),
+                );
 
-                implicits.push(&primary);
-                parent.add(primary, diagnostics);
+                unsafe {
+                    self.arena.add_implicit(phys_type.id(), primary);
+                }
+                scope.add(primary, diagnostics);
 
                 for (secondary_unit_name, value) in physical.secondary_units.iter_mut() {
-                    match self.resolve_physical_unit(parent, &mut value.unit) {
+                    match self.resolve_physical_unit(scope, &mut value.unit) {
                         Ok(secondary_unit_type) => {
-                            if secondary_unit_type.base_type() != &phys_type {
+                            if secondary_unit_type.base_type() != phys_type {
                                 diagnostics.error(
                                     &value.unit.item.pos,
                                     format!(
@@ -721,62 +940,85 @@ impl<'a> AnalyzeContext<'a> {
                         Err(err) => diagnostics.push(err),
                     }
 
-                    let secondary_unit = secondary_unit_name
-                        .define(NamedEntityKind::PhysicalLiteral(phys_type.clone()));
-                    implicits.push(&secondary_unit);
-                    parent.add(secondary_unit, diagnostics)
+                    let secondary_unit = self.arena.define(
+                        secondary_unit_name,
+                        parent,
+                        AnyEntKind::PhysicalLiteral(phys_type),
+                    );
+                    unsafe {
+                        self.arena.add_implicit(phys_type.id(), secondary_unit);
+                    }
+                    scope.add(secondary_unit, diagnostics)
                 }
 
-                if let Some(standard) = self.standard_package() {
-                    for ent in standard.physical_implicits(phys_type) {
-                        implicits.push(&ent);
-                        parent.add(ent, diagnostics);
+                for ent in self.physical_implicits(phys_type) {
+                    unsafe {
+                        self.arena.add_implicit(phys_type.id(), ent);
                     }
+                    scope.add(ent, diagnostics);
                 }
             }
             TypeDefinition::Incomplete(..) => {
                 unreachable!("Handled elsewhere");
             }
 
-            TypeDefinition::Integer(ref mut range) => {
-                self.analyze_range(parent, range, diagnostics)?;
-                let implicit = ImplicitVecBuilder::default();
+            TypeDefinition::Numeric(ref mut range) => {
+                self.range_unknown_typ(scope, range, diagnostics)?;
 
-                let kind = match integer_or_real_range(range) {
-                    ScalarType::Integer => Type::Integer(implicit.inner()),
-                    ScalarType::Real => Type::Real(implicit.inner()),
+                let universal_type = if let Some(range_typ) =
+                    as_fatal(self.range_type(scope, range, diagnostics))?
+                {
+                    if range_typ.is_any_integer() {
+                        UniversalType::Integer
+                    } else if range_typ.is_any_real() {
+                        UniversalType::Real
+                    } else {
+                        diagnostics.error(&range.pos(), "Expected real or integer range");
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
                 };
 
-                let type_ent =
-                    TypeEnt::define_with_opt_id(overwrite_id, &mut type_decl.ident, kind);
-                parent.add(type_ent.clone().into(), diagnostics);
+                let type_ent = TypeEnt::define_with_opt_id(
+                    self.arena,
+                    overwrite_id,
+                    &mut type_decl.ident,
+                    parent,
+                    None,
+                    match universal_type {
+                        UniversalType::Integer => Type::Integer,
+                        UniversalType::Real => Type::Real,
+                    },
+                );
+                scope.add(type_ent.into(), diagnostics);
 
-                if let Some(standard) = self.standard_package() {
-                    for ent in standard.integer_implicits(type_ent) {
-                        implicit.push(&ent);
-                        parent.add(ent, diagnostics);
+                for ent in self.numeric_implicits(universal_type, type_ent) {
+                    unsafe {
+                        self.arena.add_implicit(type_ent.id(), ent);
                     }
+                    scope.add(ent, diagnostics);
                 }
             }
 
             TypeDefinition::File(ref mut type_mark) => {
-                let implicit = ImplicitVecBuilder::default();
-
                 let file_type = TypeEnt::define_with_opt_id(
+                    self.arena,
                     overwrite_id,
                     &mut type_decl.ident,
-                    Type::File(implicit.inner()),
+                    parent,
+                    None,
+                    Type::File,
                 );
 
-                match self.resolve_type_mark_name(parent, type_mark) {
+                match self.resolve_type_mark(scope, type_mark) {
                     Ok(type_mark) => {
-                        if let Some(standard) = self.standard_package() {
-                            for ent in standard
-                                .create_implicit_file_type_subprograms(&file_type, &type_mark)
-                            {
-                                implicit.push(&ent);
-                                parent.add(ent, diagnostics);
+                        for ent in self.create_implicit_file_type_subprograms(file_type, type_mark)
+                        {
+                            unsafe {
+                                self.arena.add_implicit(file_type.id(), ent);
                             }
+                            scope.add(ent, diagnostics);
                         }
                     }
                     Err(err) => {
@@ -784,31 +1026,53 @@ impl<'a> AnalyzeContext<'a> {
                     }
                 }
 
-                parent.add(file_type.into(), diagnostics);
+                scope.add(file_type.into(), diagnostics);
             }
         }
 
         Ok(())
     }
 
+    /// The matching operators such as ?= are defined for 1d arrays of bit and std_ulogic element type
+    fn has_matching_op(&self, typ: TypeEnt<'a>) -> bool {
+        if self.is_std_logic_1164 {
+            // Within the std_logic_1164 we do not have efficient access to the types
+            typ.designator() == &Designator::Identifier(self.root.symbol_utf8("std_ulogic"))
+        } else {
+            if let Some(ref standard_types) = self.root.standard_types {
+                if typ.id() == standard_types.bit {
+                    return true;
+                }
+            }
+
+            if let Some(id) = self.root.std_ulogic {
+                if typ.id() == id {
+                    return true;
+                }
+            }
+
+            false
+        }
+    }
+
     pub fn resolve_signature(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
         signature: &mut WithPos<ast::Signature>,
     ) -> AnalysisResult<SignatureKey> {
         let (args, return_type) = match &mut signature.item {
             ast::Signature::Function(ref mut args, ref mut ret) => {
                 let args: Vec<_> = args
                     .iter_mut()
-                    .map(|arg| self.resolve_type_mark_name(region, arg))
+                    .map(|arg| self.resolve_type_mark(scope, arg))
                     .collect();
-                let return_type = self.resolve_type_mark_name(region, ret);
+                let return_type = self.resolve_type_mark(scope, ret);
                 (args, Some(return_type))
             }
             ast::Signature::Procedure(args) => {
                 let args: Vec<_> = args
                     .iter_mut()
-                    .map(|arg| self.resolve_type_mark_name(region, arg))
+                    .map(|arg| self.resolve_type_mark(scope, arg))
                     .collect();
                 (args, None)
             }
@@ -816,13 +1080,13 @@ impl<'a> AnalyzeContext<'a> {
 
         let mut params = Vec::with_capacity(args.len());
         for arg in args {
-            params.push(arg?.base_type().id());
+            params.push(arg?.base());
         }
 
         if let Some(return_type) = return_type {
             Ok(SignatureKey::new(
                 params,
-                Some(return_type?.base_type().id()),
+                Some(return_type?.base_type().base()),
             ))
         } else {
             Ok(SignatureKey::new(params, None))
@@ -831,69 +1095,102 @@ impl<'a> AnalyzeContext<'a> {
 
     fn analyze_interface_declaration(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         decl: &mut InterfaceDeclaration,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> AnalysisResult<Arc<NamedEntity>> {
+    ) -> AnalysisResult<EntRef<'a>> {
         let ent = match decl {
             InterfaceDeclaration::File(ref mut file_decl) => {
                 let file_type = self.resolve_subtype_indication(
-                    region,
+                    scope,
                     &mut file_decl.subtype_indication,
                     diagnostics,
                 )?;
-                file_decl.ident.define(NamedEntityKind::InterfaceFile(
-                    file_type.type_mark().to_owned(),
-                ))
+                self.arena.define(
+                    &mut file_decl.ident,
+                    parent,
+                    AnyEntKind::InterfaceFile(file_type.type_mark().to_owned()),
+                )
             }
             InterfaceDeclaration::Object(ref mut object_decl) => {
                 let subtype = self.resolve_subtype_indication(
-                    region,
+                    scope,
                     &mut object_decl.subtype_indication,
                     diagnostics,
                 );
 
                 if let Some(ref mut expression) = object_decl.expression {
                     if let Ok(ref subtype) = subtype {
-                        self.analyze_expression_with_target_type(
-                            region,
+                        self.expr_pos_with_ttyp(
+                            scope,
                             subtype.type_mark(),
                             &expression.pos,
                             &mut expression.item,
                             diagnostics,
                         )?;
                     } else {
-                        self.analyze_expression(region, expression, diagnostics)?
+                        self.expr_unknown_ttyp(scope, expression, diagnostics)?
                     }
                 }
 
                 let subtype = subtype?;
-                object_decl.ident.define(NamedEntityKind::Object(Object {
-                    class: object_decl.class,
-                    mode: Some(object_decl.mode),
-                    subtype,
-                    has_default: object_decl.expression.is_some(),
-                }))
+                self.arena.define(
+                    &mut object_decl.ident,
+                    parent,
+                    AnyEntKind::Object(Object {
+                        class: object_decl.class,
+                        iface: Some(ObjectInterface::new(
+                            object_decl.list_type,
+                            object_decl.mode,
+                        )),
+                        subtype,
+                        has_default: object_decl.expression.is_some(),
+                    }),
+                )
             }
             InterfaceDeclaration::Type(ref mut ident) => {
-                ident.define(NamedEntityKind::Type(Type::Interface))
+                let typ = TypeEnt::from_any(self.arena.define(
+                    ident,
+                    parent,
+                    AnyEntKind::Type(Type::Interface),
+                ))
+                .unwrap();
+
+                let implicit = [
+                    self.comparison(Operator::EQ, typ),
+                    self.comparison(Operator::NE, typ),
+                ];
+
+                for ent in implicit {
+                    unsafe {
+                        self.arena.add_implicit(typ.id(), ent);
+                    }
+
+                    scope.add(ent, diagnostics);
+                }
+
+                typ.into()
             }
             InterfaceDeclaration::Subprogram(ref mut subpgm, ..) => {
-                let mut subpgm_region = region.nested();
-                let signature =
-                    self.analyze_subprogram_declaration(&mut subpgm_region, subpgm, diagnostics);
-                subpgm_region.close(diagnostics);
-                drop(subpgm_region);
-
-                subpgm.define(NamedEntityKind::Subprogram(signature?))
+                let (_, ent) = self.subprogram_declaration(
+                    scope,
+                    parent,
+                    subpgm,
+                    Overloaded::InterfaceSubprogram,
+                    diagnostics,
+                )?;
+                ent.into()
             }
             InterfaceDeclaration::Package(ref mut instance) => {
                 let package_region =
-                    self.analyze_package_instance_name(region, &mut instance.package_name)?;
+                    self.analyze_package_instance_name(scope, &mut instance.package_name)?;
 
-                instance.ident.define(NamedEntityKind::LocalPackageInstance(
-                    package_region.clone(),
-                ))
+                self.arena.define(
+                    &mut instance.ident,
+                    parent,
+                    AnyEntKind::Design(Design::PackageInstance(package_region.clone())),
+                )
             }
         };
         Ok(ent)
@@ -901,14 +1198,15 @@ impl<'a> AnalyzeContext<'a> {
 
     pub fn analyze_interface_list(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         declarations: &mut [InterfaceDeclaration],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         for decl in declarations.iter_mut() {
-            match self.analyze_interface_declaration(region, decl, diagnostics) {
+            match self.analyze_interface_declaration(scope, parent, decl, diagnostics) {
                 Ok(ent) => {
-                    region.add(ent, diagnostics);
+                    scope.add(ent, diagnostics);
                 }
                 Err(err) => {
                     err.add_to(diagnostics)?;
@@ -920,16 +1218,17 @@ impl<'a> AnalyzeContext<'a> {
 
     pub fn analyze_parameter_list(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         declarations: &mut [InterfaceDeclaration],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalResult<FormalRegion> {
-        let mut params = FormalRegion::new(InterfaceListType::Parameter);
+    ) -> FatalResult<FormalRegion<'a>> {
+        let mut params = FormalRegion::new(InterfaceType::Parameter);
 
         for decl in declarations.iter_mut() {
-            match self.analyze_interface_declaration(region, decl, diagnostics) {
+            match self.analyze_interface_declaration(scope, parent, decl, diagnostics) {
                 Ok(ent) => {
-                    region.add(ent.clone(), diagnostics);
+                    scope.add(ent, diagnostics);
                     params.add(ent);
                 }
                 Err(err) => {
@@ -942,59 +1241,127 @@ impl<'a> AnalyzeContext<'a> {
 
     fn analyze_array_index(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
         array_index: &mut ArrayIndex,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalResult<Option<TypeEnt>> {
+    ) -> EvalResult<BaseType<'a>> {
         match array_index {
             ArrayIndex::IndexSubtypeDefintion(ref mut type_mark) => {
-                match self.resolve_type_mark_name(region, type_mark) {
-                    Ok(typ) => Ok(Some(typ)),
+                match self.resolve_type_mark(scope, type_mark) {
+                    Ok(typ) => Ok(typ.base()),
                     Err(err) => {
                         err.add_to(diagnostics)?;
-                        Ok(None)
+                        Err(EvalError::Unknown)
                     }
                 }
             }
-            ArrayIndex::Discrete(ref mut drange) => {
-                self.analyze_discrete_range(region, drange, diagnostics)?;
-                Ok(None)
-            }
+            ArrayIndex::Discrete(ref mut drange) => self.drange_type(scope, drange, diagnostics),
         }
-    }
-
-    fn analyze_element_constraint(
-        &self,
-        region: &Region<'_>,
-        constraint: &mut ElementConstraint,
-        diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        // @TODO more
-        let ElementConstraint { constraint, .. } = constraint;
-        self.analyze_subtype_constraint(region, &mut constraint.item, diagnostics)
     }
 
     fn analyze_subtype_constraint(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
+        pos: &SrcPos, // The position of the root type mark
+        base_type: BaseType<'a>,
         constraint: &mut SubtypeConstraint,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         match constraint {
             SubtypeConstraint::Array(ref mut dranges, ref mut constraint) => {
-                for drange in dranges.iter_mut() {
-                    self.analyze_discrete_range(region, drange, diagnostics)?;
-                }
-                if let Some(constraint) = constraint {
-                    self.analyze_subtype_constraint(region, &mut constraint.item, diagnostics)?;
+                if let Type::Array { indexes, elem_type } = base_type.kind() {
+                    for (idx, drange) in dranges.iter_mut().enumerate() {
+                        if let Some(index_typ) = indexes.get(idx) {
+                            if let Some(index_typ) = index_typ {
+                                self.drange_with_ttyp(
+                                    scope,
+                                    (*index_typ).into(),
+                                    drange,
+                                    diagnostics,
+                                )?;
+                            } else {
+                                self.drange_unknown_type(scope, drange, diagnostics)?;
+                            }
+                        } else {
+                            diagnostics.error(
+                                drange.pos(),
+                                format!("Got extra index constraint for {}", base_type.describe()),
+                            );
+                        }
+                    }
+
+                    // empty dranges means (open)
+                    if dranges.len() < indexes.len() && !dranges.is_empty() {
+                        diagnostics.error(
+                            pos,
+                            format!(
+                                "Too few index constraints for {}. Got {} but expected {}",
+                                base_type.describe(),
+                                dranges.len(),
+                                indexes.len()
+                            ),
+                        );
+                    }
+
+                    if let Some(constraint) = constraint {
+                        self.analyze_subtype_constraint(
+                            scope,
+                            &constraint.pos,
+                            elem_type.base(),
+                            &mut constraint.item,
+                            diagnostics,
+                        )?;
+                    }
+                } else {
+                    diagnostics.error(
+                        pos,
+                        format!(
+                            "Array constraint cannot be used for {}",
+                            base_type.describe()
+                        ),
+                    );
                 }
             }
             SubtypeConstraint::Range(ref mut range) => {
-                self.analyze_range(region, range, diagnostics)?;
+                if base_type.is_scalar() {
+                    self.range_with_ttyp(scope, base_type.into(), range, diagnostics)?;
+                } else {
+                    diagnostics.error(
+                        pos,
+                        format!(
+                            "Scalar constraint cannot be used for {}",
+                            base_type.describe()
+                        ),
+                    );
+                }
             }
             SubtypeConstraint::Record(ref mut constraints) => {
-                for constraint in constraints.iter_mut() {
-                    self.analyze_element_constraint(region, constraint, diagnostics)?;
+                if let Type::Record(region) = base_type.kind() {
+                    for constraint in constraints.iter_mut() {
+                        let ElementConstraint { ident, constraint } = constraint;
+                        let des = Designator::Identifier(ident.item.clone());
+                        if let Some(elem) = region.lookup(&des) {
+                            self.analyze_subtype_constraint(
+                                scope,
+                                &constraint.pos,
+                                elem.type_mark().base(),
+                                &mut constraint.item,
+                                diagnostics,
+                            )?;
+                        } else {
+                            diagnostics.push(Diagnostic::no_declaration_within(
+                                &base_type, &ident.pos, &des,
+                            ))
+                        }
+                    }
+                } else {
+                    diagnostics.error(
+                        pos,
+                        format!(
+                            "Record constraint cannot be used for {}",
+                            base_type.describe()
+                        ),
+                    );
                 }
             }
         }
@@ -1003,10 +1370,10 @@ impl<'a> AnalyzeContext<'a> {
 
     pub fn resolve_subtype_indication(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
         subtype_indication: &mut SubtypeIndication,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> AnalysisResult<Subtype> {
+    ) -> AnalysisResult<Subtype<'a>> {
         // @TODO more
         let SubtypeIndication {
             type_mark,
@@ -1014,10 +1381,16 @@ impl<'a> AnalyzeContext<'a> {
             ..
         } = subtype_indication;
 
-        let base_type = self.resolve_type_mark(region, type_mark)?;
+        let base_type = self.resolve_type_mark(scope, type_mark)?;
 
         if let Some(constraint) = constraint {
-            self.analyze_subtype_constraint(region, &mut constraint.item, diagnostics)?;
+            self.analyze_subtype_constraint(
+                scope,
+                &type_mark.pos,
+                base_type.base(),
+                &mut constraint.item,
+                diagnostics,
+            )?;
         }
 
         Ok(Subtype::new(base_type))
@@ -1025,35 +1398,75 @@ impl<'a> AnalyzeContext<'a> {
 
     pub fn analyze_subtype_indication(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
         subtype_indication: &mut SubtypeIndication,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        if let Err(err) = self.resolve_subtype_indication(region, subtype_indication, diagnostics) {
+    ) -> FatalResult {
+        if let Err(err) = self.resolve_subtype_indication(scope, subtype_indication, diagnostics) {
             err.add_to(diagnostics)?;
         }
         Ok(())
     }
 
-    fn analyze_subprogram_declaration(
+    fn subprogram_declaration(
         &self,
-        region: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         subprogram: &mut SubprogramDeclaration,
+        to_kind: impl Fn(Signature<'a>) -> Overloaded<'a>,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> AnalysisResult<Signature> {
-        match subprogram {
+    ) -> AnalysisResult<(Scope<'a>, OverloadedEnt<'a>)> {
+        let subpgm_region = scope.nested();
+        let ent = self.arena.explicit(
+            subprogram
+                .subpgm_designator()
+                .item
+                .clone()
+                .into_designator(),
+            parent,
+            AnyEntKind::Overloaded(to_kind(Signature::new(FormalRegion::new_params(), None))),
+            Some(&subprogram.subpgm_designator().pos),
+        );
+
+        let signature = match subprogram {
             SubprogramDeclaration::Function(fun) => {
-                let params =
-                    self.analyze_parameter_list(region, &mut fun.parameter_list, diagnostics);
-                let return_type = self.resolve_type_mark_name(region, &mut fun.return_type);
-                Ok(Signature::new(params?, Some(return_type?)))
+                let params = self.analyze_parameter_list(
+                    &subpgm_region,
+                    ent,
+                    &mut fun.parameter_list,
+                    diagnostics,
+                );
+                let return_type = self.resolve_type_mark(scope, &mut fun.return_type);
+                Signature::new(params?, Some(return_type?))
             }
             SubprogramDeclaration::Procedure(procedure) => {
-                let params =
-                    self.analyze_parameter_list(region, &mut procedure.parameter_list, diagnostics);
-                Ok(Signature::new(params?, None))
+                let params = self.analyze_parameter_list(
+                    &subpgm_region,
+                    ent,
+                    &mut procedure.parameter_list,
+                    diagnostics,
+                );
+                Signature::new(params?, None)
+            }
+        };
+
+        let kind = to_kind(signature);
+
+        if matches!(kind, Overloaded::Subprogram(_)) {
+            let declared_by = self.find_subpgm_declaration(scope, subprogram, kind.signature());
+
+            if let Some(declared_by) = declared_by {
+                unsafe {
+                    ent.set_declared_by(declared_by.into());
+                }
             }
         }
+
+        unsafe {
+            ent.set_kind(AnyEntKind::Overloaded(kind));
+        }
+        subprogram.set_decl_id(ent.id());
+        Ok((subpgm_region, OverloadedEnt::from_any(ent).unwrap()))
     }
 }
 
@@ -1078,31 +1491,34 @@ fn find_full_type_definition<'a>(
     None
 }
 
-fn signature_error(pos: impl AsRef<SrcPos>) -> Diagnostic {
-    Diagnostic::error(
-        pos,
-        "Alias should only have a signature for subprograms and enum literals",
-    )
-}
-
-enum ScalarType {
-    Integer,
-    Real,
-}
-
-/// @TODO A simple and incomplete way to disambiguate integer and real in standard.vhd
-fn integer_or_real_range(range: &ast::Range) -> ScalarType {
-    if let ast::Range::Range(RangeConstraint { left_expr, .. }) = range {
-        let expr = if let Expression::Unary(_, ref expr) = left_expr.item {
-            &expr.item
-        } else {
-            &left_expr.item
-        };
-
-        if let Expression::Literal(Literal::AbstractLiteral(AbstractLiteral::Real(_))) = expr {
-            return ScalarType::Real;
-        }
+impl Diagnostic {
+    fn no_overloaded_with_signature(
+        pos: &SrcPos,
+        des: &Designator,
+        overloaded: &OverloadedName,
+    ) -> Diagnostic {
+        let mut diagnostic = Diagnostic::error(
+            pos,
+            format!(
+                "Could not find declaration of {} with given signature",
+                des.describe()
+            ),
+        );
+        diagnostic.add_subprogram_candidates("Found", overloaded.entities());
+        diagnostic
     }
 
-    ScalarType::Integer
+    fn should_not_have_signature(prefix: &str, pos: impl AsRef<SrcPos>) -> Diagnostic {
+        Diagnostic::error(
+            pos,
+            format!("{prefix} should only have a signature for subprograms and enum literals"),
+        )
+    }
+
+    fn signature_required(pos: impl AsRef<SrcPos>) -> Diagnostic {
+        Diagnostic::error(
+            pos,
+            "Signature required for alias of subprogram and enum literals",
+        )
+    }
 }

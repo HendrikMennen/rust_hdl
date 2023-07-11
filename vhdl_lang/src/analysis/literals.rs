@@ -6,53 +6,76 @@ use fnv::FnvHashSet;
 //
 // Copyright (c) 2023, Olof Kraigher olof.kraigher@gmail.com
 use super::analyze::*;
+use super::named_entity::*;
 use super::region::*;
+use crate::analysis::static_expression::{bit_string_to_string, BitStringConversionError};
 use crate::ast::*;
 use crate::data::*;
 
 impl<'a> AnalyzeContext<'a> {
+    /// Analyze a string literal or expanded bit-string literal for type-matching
+    fn analyze_string_literal(
+        &self,
+        pos: &SrcPos,
+        string_lit: Latin1String,
+        target_base: TypeEnt,
+        target_type: TypeEnt,
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) {
+        if let Some((elem_type, literals)) = as_single_index_enum_array(target_base) {
+            for chr in string_lit.chars() {
+                let chr = Designator::Character(*chr);
+                if !literals.contains(&chr) {
+                    diagnostics.push(Diagnostic::error(
+                        pos,
+                        format!("{} does not define character {}", elem_type.describe(), chr),
+                    ));
+                    break;
+                }
+            }
+        } else {
+            diagnostics.push(Diagnostic::error(
+                pos,
+                format!("string literal does not match {}", target_type.describe()),
+            ));
+        }
+    }
+
     /// Returns true if the name actually matches the target type
     /// None if it was uncertain
     pub fn analyze_literal_with_target_type(
         &self,
-        region: &Region<'_>,
-        target_type: &TypeEnt,
+        scope: &Scope<'a>,
+        target_type: TypeEnt<'a>,
         pos: &SrcPos,
         literal: &mut Literal,
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalResult<bool> {
+    ) -> FatalResult {
         let target_base = target_type.base_type();
 
-        let is_correct = match literal {
+        match literal {
             Literal::AbstractLiteral(abst) => match abst {
                 AbstractLiteral::Integer(_) => {
-                    let is_correct = matches!(target_base.kind(), Type::Integer(..));
-
-                    if !is_correct {
+                    if !self.can_be_target_type(self.universal_integer().into(), target_type.base())
+                    {
                         diagnostics.push(Diagnostic::error(
                             pos,
                             format!("integer literal does not match {}", target_type.describe()),
                         ));
                     }
-                    is_correct
                 }
                 AbstractLiteral::Real(_) => {
-                    let is_correct = matches!(target_base.kind(), Type::Real(..));
-
-                    if !is_correct {
+                    if !self.can_be_target_type(self.universal_real().into(), target_type.base()) {
                         diagnostics.push(Diagnostic::error(
                             pos,
                             format!("real literal does not match {}", target_type.describe()),
                         ));
                     }
-                    is_correct
                 }
             },
             Literal::Character(char) => match target_base.kind() {
-                Type::Enum(_, literals) => {
-                    if literals.contains(&Designator::Character(*char)) {
-                        true
-                    } else {
+                Type::Enum(literals) => {
+                    if !literals.contains(&Designator::Character(*char)) {
                         diagnostics.push(Diagnostic::error(
                             pos,
                             format!(
@@ -60,7 +83,6 @@ impl<'a> AnalyzeContext<'a> {
                                 target_type.describe()
                             ),
                         ));
-                        false
                     }
                 }
                 _ => {
@@ -71,117 +93,94 @@ impl<'a> AnalyzeContext<'a> {
                             target_type.describe()
                         ),
                     ));
-                    false
                 }
             },
             Literal::String(string_lit) => {
-                if let Some((elem_type, literals)) = as_single_index_enum_array(target_base) {
-                    let mut is_correct = true;
-                    for chr in string_lit.chars() {
-                        let chr = Designator::Character(*chr);
-                        if !literals.contains(&chr) {
-                            is_correct = false;
-                            diagnostics.push(Diagnostic::error(
-                                pos,
-                                format!(
-                                    "{} does not define character {}",
-                                    elem_type.describe(),
-                                    chr
-                                ),
-                            ))
+                self.analyze_string_literal(
+                    pos,
+                    string_lit.to_owned(),
+                    target_base,
+                    target_type,
+                    diagnostics,
+                );
+            }
+            Literal::BitString(bit_string) => {
+                match bit_string_to_string(bit_string) {
+                    Ok(string_lit) => self.analyze_string_literal(
+                        pos,
+                        string_lit,
+                        target_base,
+                        target_type,
+                        diagnostics,
+                    ),
+                    Err(err) => {
+                        match err {
+                            BitStringConversionError::IllegalDecimalCharacter(rel_pos) => {
+                                diagnostics.error(
+                                    pos,
+                                    format!(
+                                        "Illegal digit '{}' for base 10",
+                                        bit_string.value.bytes[rel_pos] as char,
+                                    ),
+                                )
+                            }
+                            BitStringConversionError::IllegalTruncate(_, _) => {
+                                diagnostics.error(
+                                    pos,
+                                    format!(
+                                        "Truncating vector to length {} would lose information",
+                                        bit_string.length.unwrap() // Safe as this error can only happen when there is a length
+                                    ),
+                                );
+                            }
+                            BitStringConversionError::EmptySignedExpansion => {
+                                diagnostics.error(pos, "Cannot expand an empty signed bit string");
+                            }
                         }
                     }
-                    is_correct
-                } else {
-                    diagnostics.push(Diagnostic::error(
-                        pos,
-                        format!("string literal does not match {}", target_type.describe()),
-                    ));
-                    false
                 }
             }
             Literal::Physical(PhysicalLiteral { ref mut unit, .. }) => {
-                match self.resolve_physical_unit(region, unit) {
-                    Ok(physical_type) => physical_type.base_type() == target_base,
+                match self.resolve_physical_unit(scope, unit) {
+                    Ok(physical_type) => {
+                        if physical_type.base_type() != target_base {
+                            diagnostics.push(Diagnostic::type_mismatch(
+                                pos,
+                                &physical_type.describe(),
+                                target_type,
+                            ))
+                        }
+                    }
                     Err(diagnostic) => {
                         diagnostics.push(diagnostic);
-                        false
                     }
-                }
-            }
-            Literal::BitString(bitstring) => {
-                if let Some((elem_type, literals)) = as_single_index_enum_array(target_base) {
-                    let needs_1 = bitstring.value.chars().any(|c| *c != b'0');
-                    let c0 = Designator::Character(b'0');
-                    let c1 = Designator::Character(b'1');
-
-                    let mut is_correct = true;
-                    if !literals.contains(&c0) {
-                        is_correct = false;
-                        diagnostics.push(Diagnostic::error(
-                            pos,
-                            format!(
-                                "element {} of {} does not define character {}",
-                                elem_type.describe(),
-                                target_type.describe(),
-                                c0
-                            ),
-                        ))
-                    }
-
-                    if needs_1 && !literals.contains(&c1) {
-                        is_correct = false;
-                        diagnostics.push(Diagnostic::error(
-                            pos,
-                            format!(
-                                "element {} of {} does not define character {}",
-                                elem_type.describe(),
-                                target_type.describe(),
-                                c1
-                            ),
-                        ))
-                    }
-                    is_correct
-                } else {
-                    diagnostics.push(Diagnostic::error(
-                        pos,
-                        format!(
-                            "bit string literal does not match {}",
-                            target_type.describe()
-                        ),
-                    ));
-                    false
                 }
             }
             Literal::Null => {
-                if let Type::Access(_, _) = target_base.kind() {
-                    true
-                } else {
+                if !matches!(target_base.kind(), Type::Access(_)) {
                     diagnostics.push(Diagnostic::error(
                         pos,
                         format!("null literal does not match {}", target_base.describe()),
                     ));
-                    false
                 }
             }
         };
-
-        Ok(is_correct)
+        Ok(())
     }
 
     pub fn resolve_physical_unit(
         &self,
-        region: &Region<'_>,
+        scope: &Scope<'a>,
         unit: &mut WithRef<Ident>,
-    ) -> Result<TypeEnt, Diagnostic> {
-        match region.lookup_within(
+    ) -> Result<TypeEnt<'a>, Diagnostic> {
+        match scope.lookup(
             &unit.item.pos,
             &Designator::Identifier(unit.item.item.clone()),
         )? {
             NamedEntities::Single(unit_ent) => {
-                unit.set_unique_reference(&unit_ent);
-                if let NamedEntityKind::PhysicalLiteral(physical_ent) = unit_ent.actual_kind() {
-                    Ok(physical_ent.clone())
+                unit.set_unique_reference(unit_ent);
+                if let AnyEntKind::PhysicalLiteral(physical_ent) = unit_ent.actual_kind() {
+                    Ok(*physical_ent)
                 } else {
                     Err(Diagnostic::error(
                         &unit.item.pos,
@@ -198,14 +197,14 @@ impl<'a> AnalyzeContext<'a> {
 }
 
 /// Must be an array type with a single index of enum type
-fn as_single_index_enum_array(typ: &TypeEnt) -> Option<(&TypeEnt, &FnvHashSet<Designator>)> {
+fn as_single_index_enum_array(typ: TypeEnt) -> Option<(TypeEnt, &FnvHashSet<Designator>)> {
     if let Type::Array {
         indexes, elem_type, ..
     } = typ.kind()
     {
         if indexes.len() == 1 {
-            if let Type::Enum(_, literals) = elem_type.base_type().kind() {
-                return Some((elem_type, literals));
+            if let Type::Enum(literals) = elem_type.base_type().kind() {
+                return Some((*elem_type, literals));
             }
         }
     }

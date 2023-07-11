@@ -1,23 +1,122 @@
 [libraries]
 
 vunit_lib.files = [
-'vunit/vunit/vhdl/*.vhd',
+"vunit/vunit/vhdl/check/src/check_api.vhd", 
+"vunit/vunit/vhdl/check/src/check_deprecated_pkg.vhd", 
+"vunit/vunit/vhdl/check/src/check.vhd", 
+"vunit/vunit/vhdl/check/src/checker_pkg-body.vhd", 
+"vunit/vunit/vhdl/check/src/checker_pkg.vhd", 
+"vunit/vunit/vhdl/com/src/com_api.vhd", 
+"vunit/vunit/vhdl/com/src/com_common.vhd", 
+"vunit/vunit/vhdl/com/src/com_context.vhd", 
+"vunit/vunit/vhdl/com/src/com_debug_codec_builder.vhd", 
+"vunit/vunit/vhdl/com/src/com_deprecated.vhd", 
+"vunit/vunit/vhdl/com/src/com_messenger.vhd", 
+"vunit/vunit/vhdl/com/src/com_string.vhd", 
+"vunit/vunit/vhdl/com/src/com_support.vhd", 
+"vunit/vunit/vhdl/com/src/com_types.vhd", 
+"vunit/vunit/vhdl/com/src/com.vhd", 
+"vunit/vunit/vhdl/core/src/core_pkg.vhd", 
+"vunit/vunit/vhdl/core/src/stop_body_2008p.vhd", 
+"vunit/vunit/vhdl/core/src/stop_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/api/external_integer_vector_pkg.vhd",
+"vunit/vunit/vhdl/data_types/src/api/external_string_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/byte_vector_ptr_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/codec_builder-2008p.vhd", 
+"vunit/vunit/vhdl/data_types/src/codec_builder.vhd", 
+"vunit/vunit/vhdl/data_types/src/codec-2008p.vhd", 
+"vunit/vunit/vhdl/data_types/src/codec.vhd", 
+"vunit/vunit/vhdl/data_types/src/data_types_context.vhd", 
+"vunit/vunit/vhdl/data_types/src/data_types_private_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/dict_pkg-2008p.vhd", 
+"vunit/vunit/vhdl/data_types/src/dict_pkg-body.vhd", 
+"vunit/vunit/vhdl/data_types/src/dict_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/id_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/integer_array_pkg-body.vhd", 
+"vunit/vunit/vhdl/data_types/src/integer_array_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/integer_vector_ptr_pkg-body-2002p.vhd", 
+"vunit/vunit/vhdl/data_types/src/integer_vector_ptr_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/integer_vector_ptr_pool_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/queue_pkg-2008p.vhd", 
+"vunit/vunit/vhdl/data_types/src/queue_pkg-body.vhd", 
+"vunit/vunit/vhdl/data_types/src/queue_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/queue_pool_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/string_ptr_pkg-body-2002p.vhd", 
+"vunit/vunit/vhdl/data_types/src/string_ptr_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/string_ptr_pool_pkg.vhd", 
+"vunit/vunit/vhdl/data_types/src/types.vhd", 
+"vunit/vunit/vhdl/dictionary/src/dictionary.vhd", 
+"vunit/vunit/vhdl/logging/src/ansi_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/file_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/location_pkg-body-2008m.vhd", 
+"vunit/vunit/vhdl/logging/src/location_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/log_deprecated_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/log_handler_pkg-body.vhd", 
+"vunit/vunit/vhdl/logging/src/log_handler_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/log_levels_pkg-body.vhd", 
+"vunit/vunit/vhdl/logging/src/log_levels_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/logger_pkg-body.vhd", 
+"vunit/vunit/vhdl/logging/src/logger_pkg.vhd", 
+"vunit/vunit/vhdl/logging/src/print_pkg-body.vhd", 
+"vunit/vunit/vhdl/logging/src/print_pkg.vhd", 
+"vunit/vunit/vhdl/path/src/path.vhd", 
+"vunit/vunit/vhdl/run/src/run_api.vhd", 
+"vunit/vunit/vhdl/run/src/run_deprecated_pkg.vhd", 
+"vunit/vunit/vhdl/run/src/run_types.vhd", 
+"vunit/vunit/vhdl/run/src/run.vhd", 
+"vunit/vunit/vhdl/run/src/runner_pkg.vhd", 
+"vunit/vunit/vhdl/string_ops/src/string_ops.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_sink.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_slave.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_source.vhd", 
+"vunit/vunit/vhdl/verification_components/src/avalon_stream_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_lite_master_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_lite_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_read_slave.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_slave_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_slave_private_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_statistics_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_monitor.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_private_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_protocol_checker.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_stream_slave.vhd", 
+"vunit/vunit/vhdl/verification_components/src/axi_write_slave.vhd", 
+"vunit/vunit/vhdl/verification_components/src/bus_master_pkg-body.vhd", 
+"vunit/vunit/vhdl/verification_components/src/bus_master_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/bus2memory.vhd", 
+"vunit/vunit/vhdl/verification_components/src/memory_pkg-body.vhd", 
+"vunit/vunit/vhdl/verification_components/src/memory_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/memory_utils_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/ram_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/signal_checker_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/std_logic_checker.vhd", 
+"vunit/vunit/vhdl/verification_components/src/stream_master_pkg-body.vhd", 
+"vunit/vunit/vhdl/verification_components/src/stream_master_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/stream_slave_pkg-body.vhd", 
+"vunit/vunit/vhdl/verification_components/src/stream_slave_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/sync_pkg-body.vhd", 
+"vunit/vunit/vhdl/verification_components/src/sync_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/uart_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/uart_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/uart_slave.vhd", 
+"vunit/vunit/vhdl/verification_components/src/vc_context.vhd", 
+"vunit/vunit/vhdl/verification_components/src/wishbone_master.vhd", 
+"vunit/vunit/vhdl/verification_components/src/wishbone_pkg.vhd", 
+"vunit/vunit/vhdl/verification_components/src/wishbone_slave.vhd", 
+"vunit/vunit/vhdl/vunit_context.vhd", 
+"vunit/vunit/vhdl/vunit_run_context.vhd", 
+"vunit/vunit/vhdl/random/src/random_pkg.vhd",
 
-'vunit/vunit/vhdl/logging/test/*.vhd',
-'vunit/vunit/vhdl/logging/src/*.vhd',
-
-'vunit/vunit/vhdl/string_ops/test/*.vhd',
-'vunit/vunit/vhdl/string_ops/src/*.vhd',
-
-'vunit/vunit/vhdl/core/src/stop_body_2008p.vhd',
-'vunit/vunit/vhdl/core/src/core_pkg.vhd',
-'vunit/vunit/vhdl/core/src/stop_pkg.vhd',
-
-'vunit/vunit/vhdl/array/test/*.vhd',
-'vunit/vunit/vhdl/array/src/*.vhd',
-
+# Also add tests
 'vunit/vunit/vhdl/run/test/*.vhd',
-'vunit/vunit/vhdl/run/src/*.vhd',
+'vunit/vunit/vhdl/logging/test/*.vhd',
+'vunit/vunit/vhdl/string_ops/test/*.vhd',
+'vunit/vunit/vhdl/run/test/*.vhd',
 
 'vunit/vunit/vhdl/check/test/tb_checker.vhd',
 'vunit/vunit/vhdl/check/test/tb_check_next.vhd',
@@ -37,38 +136,14 @@ vunit_lib.files = [
 'vunit/vunit/vhdl/check/test/tb_check_false.vhd',
 'vunit/vunit/vhdl/check/test/tb_check_relation.vhd',
 'vunit/vunit/vhdl/check/test/tb_check.vhd',
-'vunit/vunit/vhdl/check/src/*.vhd',
 
 'vunit/vunit/vhdl/verification_components/test/*.vhd',
-'vunit/vunit/vhdl/verification_components/src/*.vhd',
-
-'vunit/vunit/vhdl/random/test/*.vhd',
-'vunit/vunit/vhdl/random/src/*.vhd',
 
 'vunit/vunit/vhdl/data_types/test/*.vhd',
 
-'vunit/vunit/vhdl/data_types/src/codec.vhd',
-'vunit/vunit/vhdl/data_types/src/integer_array_pkg-body.vhd',
-'vunit/vunit/vhdl/data_types/src/queue_pool_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/integer_vector_ptr_pool_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/queue_pkg-body.vhd',
-'vunit/vunit/vhdl/data_types/src/integer_vector_ptr_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/dict_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/queue_pkg-2008p.vhd',
-'vunit/vunit/vhdl/data_types/src/string_ptr_pool_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/codec-2008p.vhd',
-'vunit/vunit/vhdl/data_types/src/string_ptr_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/queue_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/codec_builder.vhd',
-'vunit/vunit/vhdl/data_types/src/integer_array_pkg.vhd',
-'vunit/vunit/vhdl/data_types/src/codec_builder-2008p.vhd',
-'vunit/vunit/vhdl/data_types/src/data_types_context.vhd',
-'vunit/vunit/vhdl/data_types/src/types.vhd',
-'vunit/vunit/vhdl/data_types/src/external/*novhpi.vhd',
-'vunit/vunit/vhdl/data_types/src/byte_vector*.vhd',
+
 
 'vunit/vunit/vhdl/path/test/*.vhd',
-'vunit/vunit/vhdl/path/src/*.vhd',
 
 'vunit/vunit/vhdl/com/test/constants.vhd',
 'vunit/vunit/vhdl/com/test/more_constants.vhd',
@@ -77,105 +152,145 @@ vunit_lib.files = [
 'vunit/vunit/vhdl/com/test/tb_com_msg_building.vhd',
 'vunit/vunit/vhdl/com/test/tb_com_deprecated.vhd',
 'vunit/vunit/vhdl/com/test/tb_com.vhd',
-'vunit/vunit/vhdl/com/src/*.vhd',
 
 'vunit/vunit/vhdl/dictionary/test/*.vhd',
-'vunit/vunit/vhdl/dictionary/src/*.vhd',
 ]
 
 osvvm.files = [
-'OSVVM/TbUtilPkg.vhd',
-'OSVVM/OsvvmGlobalPkg.vhd',
-'OSVVM/RandomBasePkg.vhd',
-'OSVVM/VendorCovApiPkg.vhd',
-'OSVVM/OsvvmContext.vhd',
-'OSVVM/ScoreboardPkg_slv.vhd',
-'OSVVM/NamePkg.vhd',
-'OSVVM/RandomPkg.vhd',
-'OSVVM/ScoreboardPkg_int.vhd',
-'OSVVM/SortListPkg_int.vhd',
-'OSVVM/MemoryPkg.vhd',
 'OSVVM/AlertLogPkg.vhd',
-'OSVVM/demo/AlertLog_Demo_Hierarchy.vhd',
-'OSVVM/demo/AlertLog_Demo_Global.vhd',
-'OSVVM/demo/Demo_Rand.vhd',
-'OSVVM/TranscriptPkg.vhd',
 'OSVVM/CoveragePkg.vhd',
+'OSVVM/MemoryGenericPkg.vhd',
+'OSVVM/MemoryPkg.vhd',
+#'OSVVM/MemoryPkg_c.vhd',
+#'OSVVM/MemoryPkg_orig_c.vhd',
+'OSVVM/MemorySupportPkg.vhd',
+'OSVVM/MessageListPkg.vhd',
 'OSVVM/MessagePkg.vhd',
+'OSVVM/NamePkg.vhd',
+'OSVVM/NameStorePkg.vhd',
+'OSVVM/OsvvmContext.vhd',
+'OSVVM/OsvvmGlobalPkg.vhd',
+'OSVVM/OsvvmTypesPkg.vhd',
+'OSVVM/RandomBasePkg.vhd',
+'OSVVM/RandomPkg.vhd',
+'OSVVM/RandomProcedurePkg.vhd',
+'OSVVM/ReportPkg.vhd',
+'OSVVM/ResizePkg.vhd',
 'OSVVM/ResolutionPkg.vhd',
-'OSVVM/TextUtilPkg.vhd',
 'OSVVM/ScoreboardGenericPkg.vhd',
+'OSVVM/ScoreboardPkg_int.vhd',
+#'OSVVM/ScoreboardPkg_int_c.vhd',
+'OSVVM/ScoreboardPkg_slv.vhd',
+#'OSVVM/ScoreboardPkg_slv_c.vhd',
+'OSVVM/SortListPkg_int.vhd',
+'OSVVM/TbUtilPkg.vhd',
+'OSVVM/TextUtilPkg.vhd',
+'OSVVM/TranscriptPkg.vhd',
+'OSVVM/VendorCovApiPkg.vhd',
+#'OSVVM/VendorCovApiPkg_Aldec.vhd',
 ]
 
 uvvm_util.files = [
-'UVVM/uvvm_util/src/*.vhd',
+'UVVM/uvvm_util/**/*.vhd',
 ]
 
 uvvm_vvc_framework.files = [
 'UVVM/uvvm_vvc_framework/src/*.vhd',
 ]
 
-bitvis_vip_uart.files = [
+bitvis_vip_avalon_mm.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_uart/src/*.vhd',
+'UVVM/bitvis_vip_avalon_mm/**/*.vhd',
+]
+
+bitvis_vip_avalon_st.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_avalon_st/**/*.vhd',
+]
+
+bitvis_vip_axi.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_axi/**/*.vhd',
 ]
 
 bitvis_vip_axilite.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_axilite/src/*.vhd',
-]
-
-bitvis_vip_i2c.files = [
-'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_i2c/src/*.vhd',
-]
-
-bitvis_vip_clock_generator.files = [
-'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_clock_generator/src/*.vhd',
-]
-
-bitvis_vip_scoreboard.files = [
-#'UVVM/bitvis_vip_scoreboard/demo/*.vhd',
-'UVVM/bitvis_vip_scoreboard/src/*.vhd',
-]
-
-bitvis_vip_spi.files = [
-'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_spi/src/*.vhd',
-]
-
-bitvis_uart.files = [
-'UVVM/bitvis_uart/tb/*.vhd',
-'UVVM/bitvis_uart/src/*.vhd',
-]
-
-bitvis_irqc.files = [
-'UVVM/bitvis_irqc/tb/*.vhd',
-'UVVM/bitvis_irqc/src/*.vhd',
+'UVVM/bitvis_vip_axilite/**/*.vhd',
 ]
 
 bitvis_vip_axistream.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_axistream/src/*.vhd',
+'UVVM/bitvis_vip_axistream/**/*.vhd',
 ]
 
-bitvis_vip_avalon_mm.files = [
+bitvis_vip_clock_generator.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_avalon_mm/src/*.vhd',
+'UVVM/bitvis_vip_clock_generator/**/*.vhd',
 ]
 
-bitvis_vip_sbi.files = [
+bitvis_vip_error_injection.files = [
+ 'UVVM/bitvis_vip_error_injection/**/*.vhd',
+]
+
+bitvis_vip_ethernet.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-'UVVM/bitvis_vip_sbi/src/*.vhd',
+'UVVM/bitvis_vip_ethernet/**/*.vhd',
+]
+
+bitvis_vip_gmii.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_gmii/**/*.vhd',
 ]
 
 bitvis_vip_gpio.files = [
 'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
-#'UVVM/bitvis_vip_gpio/tb/*.vhd',
-'UVVM/bitvis_vip_gpio/src/*.vhd',
+'UVVM/bitvis_vip_gpio/**/*.vhd',
 ]
 
+bitvis_vip_hvvc_to_vvc_bridge.files = [
+'UVVM/bitvis_vip_hvvc_to_vvc_bridge/**/*.vhd',
+]
+
+bitvis_vip_i2c.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_i2c/**/*.vhd',
+]
+
+bitvis_vip_rgmii.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_rgmii/**/*.vhd',
+]
+
+bitvis_vip_sbi.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_sbi/**/*.vhd',
+]
+
+bitvis_vip_spec_cov.files = [
+'UVVM/bitvis_vip_spec_cov/src/*.vhd',
+]
+
+bitvis_vip_scoreboard.files = [
+'UVVM/bitvis_vip_scoreboard/**/*.vhd',
+]
+
+bitvis_vip_spi.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_spi/**/*.vhd',
+]
+
+bitvis_vip_uart.files = [
+'UVVM/uvvm_vvc_framework/src_target_dependent/*.vhd',
+'UVVM/bitvis_vip_uart/**/*.vhd',
+]
+
+bitvis_uart.files = [
+'UVVM/bitvis_uart/**/*.vhd',
+]
+
+bitvis_irqc.files = [
+'UVVM/bitvis_irqc/**/*.vhd',
+]
 
 PoC.files = [
 'PoC/src/sim/sim_global.v08.vhdl',
@@ -243,13 +358,14 @@ PoC.files = [
 #'PoC/src/net/ipv6/*.vhdl',
 #'PoC/src/net/*.vhdl',
 
-'PoC/src/bus/stream/stream_Source.vhdl',
+#'PoC/src/bus/stream/stream_Source.vhdl',
 'PoC/src/bus/stream/stream_DeMux.vhdl',
 # Is this file broken, contains undefined types?
 #'PoC/src/bus/stream/stream_FrameGenerator.vhdl',
 'PoC/src/bus/stream/stream_Mirror.vhdl',
 'PoC/src/bus/stream/stream_Mux.vhdl',
-'PoC/src/bus/stream/stream.pkg.vhdl',
+# Ambiguous use of to string
+#'PoC/src/bus/stream/stream.pkg.vhdl',
 'PoC/src/bus/stream/stream_Buffer.vhdl',
 
 'PoC/src/bus/*.vhdl',
@@ -274,8 +390,13 @@ PoC.files = [
 
 'PoC/src/sort/sortnet/*.vhdl',
 'PoC/src/sort/*.vhdl',
-'PoC/src/fifo/*.vhdl',
-
+'PoC/src/fifo/fifo.pkg.vhdl',
+'PoC/src/fifo/fifo_cc_got.vhdl',
+'PoC/src/fifo/fifo_cc_got_tempgot.vhdl',
+'PoC/src/fifo/fifo_cc_got_tempput.vhdl',
+'PoC/src/fifo/fifo_glue.vhdl',
+'PoC/src/fifo/fifo_ic_assembly.vhdl',
+'PoC/src/fifo/fifo_shift.vhdl',
 'PoC/src/xil/xil.pkg.vhdl',
 #'PoC/src/xil/xil_ICAP.vhdl',
 #'PoC/src/xil/reconfig/reconfig_icap_wrapper.vhdl',
@@ -328,4 +449,13 @@ PoC.files = [
 
 'PoC/src/misc/*.vhdl',
 'PoC/src/dstruct/*.vhdl',
+]
+
+neorv32.files = [
+'neorv32/rtl/core/*.vhd',
+'neorv32/rtl/core/mem/*default*.vhd',
+'neorv32/rtl/processor_templates/*.vhd',
+'neorv32/rtl/system_integration/*.vhd',
+'neorv32/rtl/test_setups/*.vhd',
+'neorv32/sim/*.vhd',
 ]

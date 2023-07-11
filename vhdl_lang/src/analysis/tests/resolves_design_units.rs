@@ -151,7 +151,7 @@ end architecture;
         builder.analyze(),
         vec![Diagnostic::error(
             code.s("missing", 1),
-            "No entity 'missing' within library 'libname'",
+            "No primary unit 'missing' within library 'libname'",
         )],
     );
 }
@@ -196,7 +196,7 @@ end package body;
         builder.analyze(),
         vec![Diagnostic::error(
             code.s("missing", 1),
-            "No package 'missing' within library 'libname'",
+            "No primary unit 'missing' within library 'libname'",
         )],
     );
 }
@@ -396,13 +396,20 @@ end package body;
 
     // From reference position
     assert_eq!(
-        root.search_reference_pos(code.source(), code.s("pkg", 2).start()),
-        Some(code.s("pkg", 1).pos())
+        root.search_reference(code.source(), code.s("pkg", 2).start())
+            .unwrap()
+            .declaration()
+            .decl_pos(),
+        Some(&code.s("pkg", 1).pos())
     );
 
     // Find all references
     assert_eq_unordered(
         &root.find_all_references_pos(&code.s1("pkg").pos()),
+        &[code.s("pkg", 1).pos(), code.s("pkg", 2).pos()],
+    );
+    assert_eq_unordered(
+        &root.find_all_references_pos(&code.s("pkg", 2).pos()),
         &[code.s("pkg", 1).pos(), code.s("pkg", 2).pos()],
     );
 }
@@ -500,5 +507,35 @@ end architecture;
             "configuration",
             "entity 'bad'",
         )],
+    );
+}
+
+#[test]
+fn empty_component_instantiation() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+entity ent is
+end entity;
+
+architecture a of ent is
+    component empty
+    end component;
+begin
+    inst: empty;
+end architecture;
+
+
+",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+    assert_eq!(
+        root.search_reference(code.source(), code.sa("inst: ", "empty").start())
+            .unwrap()
+            .decl_pos(),
+        Some(&code.s1("empty").pos())
     );
 }

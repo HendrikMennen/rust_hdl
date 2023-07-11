@@ -137,7 +137,7 @@ pub mod test_support {
             if !std::thread::panicking() {
                 let expected = self.expected.replace(VecDeque::new());
                 if !expected.is_empty() {
-                    panic!("Not all expected data was consumed\n{:#?}", expected);
+                    panic!("Not all expected data was consumed\n{expected:#?}");
                 }
             }
         }
@@ -166,10 +166,7 @@ pub mod test_support {
                 .borrow_mut()
                 .pop_front()
                 .ok_or_else(|| {
-                    panic!(
-                        "No expected value, got notification method={} {:?}",
-                        method, notification
-                    )
+                    panic!("No expected value, got notification method={method} {notification:?}")
                 })
                 .unwrap();
 
@@ -190,16 +187,10 @@ pub mod test_support {
                         notification, contains
                     );
                     if !contains_string(&notification, &contains) {
-                        panic!(
-                            "{:?} does not contain sub-string {:?}",
-                            notification, contains
-                        );
+                        panic!("{notification:?} does not contain sub-string {contains:?}");
                     }
                 }
-                _ => panic!(
-                    "Expected {:?}, got notification {} {:?}",
-                    expected, method, notification
-                ),
+                _ => panic!("Expected {expected:?}, got notification {method} {notification:?}"),
             }
         }
 
@@ -208,12 +199,7 @@ pub mod test_support {
                 .expected
                 .borrow_mut()
                 .pop_front()
-                .ok_or_else(|| {
-                    panic!(
-                        "No expected value, got request method={} {:?}",
-                        method, params
-                    )
-                })
+                .ok_or_else(|| panic!("No expected value, got request method={method} {params:?}"))
                 .unwrap();
 
             match expected {
@@ -223,10 +209,7 @@ pub mod test_support {
                 } => {
                     assert_eq!((method, params), (exp_method, exp_params));
                 }
-                _ => panic!(
-                    "Expected {:?}, got request {} {:?}",
-                    expected, method, params
-                ),
+                _ => panic!("Expected {expected:?}, got request {method} {params:?}"),
             }
         }
     }

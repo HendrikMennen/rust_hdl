@@ -12,7 +12,7 @@
 use clap::Parser;
 use std::path::Path;
 use std::time::SystemTime;
-use vhdl_lang::{Config, Diagnostic, MessagePrinter, Project};
+use vhdl_lang::{Config, Diagnostic, MessagePrinter, NullMessages, Project, Severity};
 
 /// Run vhdl analysis
 #[derive(Parser, Debug)]
@@ -25,6 +25,14 @@ struct Args {
     /// Prints the number of files processed and the execution time
     #[arg(long, default_value_t = false)]
     perf: bool,
+
+    /// Run repeatedly to get a reliable benchmark result
+    #[arg(long, default_value_t = false)]
+    bench: bool,
+
+    /// Hide hint diagnostics
+    #[arg(long, default_value_t = false)]
+    no_hint: bool,
 
     /// Config file in TOML format containing libraries and settings
     #[arg(short, long)]
@@ -57,12 +65,30 @@ fn main() {
     );
 
     let start = SystemTime::now();
+
+    let iterations = if args.bench {
+        let iterations = 10;
+        println!("Running {iterations} iterations for benchmarking");
+        for _ in 0..(iterations - 1) {
+            let mut project = Project::from_config(&config, &mut NullMessages);
+            project.analyse();
+        }
+        iterations
+    } else {
+        1
+    };
+
     let mut project = Project::from_config(&config, &mut msg_printer);
-    let diagnostics = project.analyse();
-    let duration = start.elapsed().unwrap();
+    let mut diagnostics = project.analyse();
+    let duration = start.elapsed().unwrap() / iterations;
+
+    if args.no_hint {
+        diagnostics.retain(|diag| diag.severity != Severity::Hint);
+    }
+
     show_diagnostics(&diagnostics);
 
-    if args.perf {
+    if args.perf || args.bench {
         let mut num_files = 0;
         let mut num_lines = 0;
         for source_file in project.files() {
@@ -71,10 +97,7 @@ fn main() {
         }
         let duration_per_line = duration.checked_div(num_lines as u32).unwrap();
 
-        println!(
-            "Analyzed {} files with {} lines of code",
-            num_files, num_lines
-        );
+        println!("Analyzed {num_files} files with {num_lines} lines of code");
         println!(
             "Total time to run was {} ms with an average of {} ns per line",
             duration.as_millis(),
@@ -103,5 +126,9 @@ fn main() {
 fn show_diagnostics(diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         println!("{}", diagnostic.show());
+    }
+
+    if !diagnostics.is_empty() {
+        println!("Found {} diagnostics", diagnostics.len());
     }
 }

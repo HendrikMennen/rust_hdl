@@ -4,15 +4,14 @@
 //
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
-use crate::analysis::{DesignRoot, NamedEntity};
+use crate::analysis::{AnyEnt, DesignRoot, EntRef};
 use crate::ast::DesignFile;
 use crate::config::Config;
-use crate::data::*;
 use crate::syntax::VHDLParser;
+use crate::{data::*, EntHierarchy};
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 pub struct Project {
     parser: VHDLParser,
@@ -152,6 +151,17 @@ impl Project {
         }
     }
 
+    pub fn library_mapping_of(&self, source: &Source) -> Vec<Symbol> {
+        let file = if let Some(file) = self.files.get(source.file_name()) {
+            file
+        } else {
+            return Vec::new();
+        };
+        let mut libs: Vec<_> = file.library_names.iter().cloned().collect();
+        libs.sort_by_key(|lib| lib.name_utf8());
+        libs
+    }
+
     pub fn get_source(&self, file_name: &Path) -> Option<Source> {
         self.files.get(file_name).map(|file| file.source.clone())
     }
@@ -223,17 +233,53 @@ impl Project {
     ///
     /// If the character value is greater than the line length it defaults back to the
     /// line length.
-    pub fn search_reference(&self, source: &Source, cursor: Position) -> Option<Arc<NamedEntity>> {
-        self.root.search_reference(source, cursor)
+    pub fn find_definition<'a>(&'a self, source: &Source, cursor: Position) -> Option<EntRef<'a>> {
+        let ent = self.root.search_reference(source, cursor)?;
+        self.root.find_definition_of(ent)
+    }
+
+    pub fn find_declaration<'a>(&'a self, source: &Source, cursor: Position) -> Option<EntRef<'a>> {
+        let ent = self.root.search_reference(source, cursor)?;
+        Some(ent.declaration())
+    }
+
+    pub fn item_at_cursor<'a>(
+        &'a self,
+        source: &Source,
+        cursor: Position,
+    ) -> Option<(SrcPos, EntRef<'a>)> {
+        self.root.item_at_cursor(source, cursor)
+    }
+
+    // Find symbols that are public such as primary design units and their interfaces
+    pub fn public_symbols<'a>(&'a self) -> Box<dyn Iterator<Item = EntRef<'a>> + 'a> {
+        self.root.public_symbols()
+    }
+
+    // Find symbols that are public such as primary design units and their interfaces
+    pub fn document_symbols<'a>(
+        &'a self,
+        library_name: &Symbol,
+        source: &Source,
+    ) -> Vec<EntHierarchy<'a>> {
+        self.root.document_symbols(library_name, source)
+    }
+
+    pub fn find_implementation<'a>(&'a self, source: &Source, cursor: Position) -> Vec<EntRef<'a>> {
+        if let Some(ent) = self.find_declaration(source, cursor) {
+            self.root.find_implementation(ent)
+        } else {
+            Vec::default()
+        }
     }
 
     /// Search for the declaration at decl_pos and format it
-    pub fn format_declaration(&self, ent: Arc<NamedEntity>) -> Option<String> {
+    pub fn format_declaration(&self, ent: &AnyEnt) -> Option<String> {
         self.root.format_declaration(ent)
     }
 
     /// Search for all references to the declaration at decl_pos
-    pub fn find_all_references(&self, ent: Arc<NamedEntity>) -> Vec<SrcPos> {
+    pub fn find_all_references(&self, ent: &AnyEnt) -> Vec<SrcPos> {
         self.root.find_all_references(ent)
     }
 
@@ -464,10 +510,11 @@ package is
         ",
         );
         let diagnostics = project.analyse();
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 3);
         // Syntax error comes first
         assert_eq!(diagnostics[0].pos.source, source1);
-        assert_eq!(diagnostics[1].pos.source, source2);
+        assert_eq!(diagnostics[1].pos.source, source1);
+        assert_eq!(diagnostics[2].pos.source, source2);
 
         // Make it good again
         update(

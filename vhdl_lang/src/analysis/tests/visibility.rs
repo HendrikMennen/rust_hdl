@@ -510,19 +510,19 @@ pub fn hidden_error(
 ) -> Diagnostic {
     let mut error = Diagnostic::error(
         code.s(name, occ),
-        format!("Name '{}' is hidden by conflicting use clause", name),
+        format!("Name '{name}' is hidden by conflicting use clause"),
     );
 
     for (code, substr, occ, declared) in related.iter() {
         if *declared {
             error.add_related(
                 code.s(substr, *occ),
-                format!("Conflicting name '{}' declared here", name),
+                format!("Conflicting name '{name}' declared here"),
             )
         } else {
             error.add_related(
                 code.s(substr, *occ),
-                format!("Conflicting name '{}' made visible here", name),
+                format!("Conflicting name '{name}' made visible here"),
             )
         }
     }
@@ -697,4 +697,63 @@ end function;
         root.search_reference_pos(code.source(), code.s1("theproc(arg)").start()),
         Some(code.s("theproc", 2).pos())
     );
+}
+
+#[test]
+fn labels_are_visible_in_declarative_region() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+entity ent is
+end entity;
+
+architecture a of ent is
+  attribute debug : boolean;
+  attribute debug of main : label is true;
+begin
+  main: process
+  begin
+      wait;
+  end process;
+end architecture;
+
+",
+    );
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+    let label = root
+        .search_reference(code.source(), code.sa("debug of ", "main").start())
+        .unwrap();
+    assert_eq!(label.decl_pos(), Some(&code.sb("main", ": process").pos()));
+}
+
+#[test]
+fn sequential_labels_are_visible_in_declarative_region() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+entity ent is
+end entity;
+
+architecture a of ent is
+begin
+  process
+    attribute debug : boolean;
+    attribute debug of main : label is true;
+  begin
+    main: for i in 0 to 1 loop
+    end loop;
+    wait;
+  end process;
+end architecture;
+",
+    );
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+    let label = root
+        .search_reference(code.source(), code.sa("debug of ", "main").start())
+        .unwrap();
+    assert_eq!(label.decl_pos(), Some(&code.sb("main", ": for i ").pos()));
 }

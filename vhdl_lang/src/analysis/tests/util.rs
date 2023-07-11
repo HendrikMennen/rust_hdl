@@ -43,6 +43,11 @@ impl LibraryBuilder {
         code
     }
 
+    /// Just get a Code object using the same symbol table but without adding it to any library
+    pub fn snippet(&mut self, code: &str) -> Code {
+        self.code_builder.code(code)
+    }
+
     pub fn in_declarative_region(&mut self, code: &str) -> Code {
         self.code(
             "libname",
@@ -52,12 +57,16 @@ entity ent is
 end entity;
 
 architecture a of ent is
-{}
+{code}
 begin
-end architecture;",
-                code
+end architecture;"
             ),
         )
+    }
+
+    pub fn add_std_logic_1164(&mut self) {
+        let std_logic_1164 = self.code_builder.code_from_source(std_logic_1164_package());
+        self.add_code("ieee", std_logic_1164);
     }
 
     pub fn get_analyzed_root(&self) -> (DesignRoot, Vec<Diagnostic>) {
@@ -65,7 +74,6 @@ end architecture;",
         let mut diagnostics = Vec::new();
 
         add_standard_library(self.symbols(), &mut root);
-        root.analyze(&mut diagnostics);
 
         for (library_name, codes) in self.libraries.iter() {
             for code in codes {
@@ -119,6 +127,16 @@ fn env_package() -> Source {
     )
 }
 
+fn std_logic_1164_package() -> Source {
+    Source::inline(
+        Path::new("std_logic_1164.vhd"),
+        &Latin1String::new(include_bytes!(
+            "../../../../vhdl_libraries/ieee2008/std_logic_1164.vhdl"
+        ))
+        .to_string(),
+    )
+}
+
 pub fn add_standard_library(symbols: Arc<Symbols>, root: &mut DesignRoot) {
     let builder = CodeBuilder {
         symbols: symbols.clone(),
@@ -134,7 +152,7 @@ pub fn add_standard_library(symbols: Arc<Symbols>, root: &mut DesignRoot) {
 }
 
 pub fn missing(code: &Code, name: &str, occ: usize) -> Diagnostic {
-    Diagnostic::error(code.s(name, occ), format!("No declaration of '{}'", name))
+    Diagnostic::error(code.s(name, occ), format!("No declaration of '{name}'"))
 }
 
 pub fn duplicate(code: &Code, name: &str, occ1: usize, occ2: usize) -> Diagnostic {
@@ -206,9 +224,10 @@ pub fn check_search_reference_with_name(decl_name: &str, contents: &str) {
     let mut references = Vec::new();
     for idx in 1..=occurences {
         assert_eq!(
-            root.search_reference_pos(code.source(), code.s(decl_name, idx).end()),
+            root.search_reference(code.source(), code.s(decl_name, idx).end())
+                .and_then(|ent| ent.declaration().decl_pos().cloned()),
             Some(code.s(decl_name, 1).pos()),
-            "{}",
+            "{decl_name}, occurence {}",
             idx
         );
         references.push(code.s(decl_name, idx).pos());

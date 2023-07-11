@@ -4,31 +4,30 @@
 //
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
-use super::common::ParseResult;
+use super::common::{check_end_identifier_mismatch, ParseResult};
 use super::declarative_part::parse_declarative_part;
 use super::interface_declaration::parse_parameter_interface_list;
-use super::names::parse_selected_name;
+use super::names::parse_type_mark;
 use super::sequential_statement::parse_labeled_sequential_statements;
 use super::tokens::{kinds_error, Kind::*, TokenStream};
 use crate::ast::*;
 use crate::data::*;
 
-pub fn parse_signature(stream: &mut TokenStream) -> ParseResult<WithPos<Signature>> {
+pub fn parse_signature(stream: &TokenStream) -> ParseResult<WithPos<Signature>> {
     let left_square = stream.expect_kind(LeftSquare)?;
-    let start_pos = left_square.pos;
+    let start_pos = &left_square.pos;
     let mut type_marks = Vec::new();
     let mut return_mark = None;
 
-    let token = stream.peek_expect()?;
-    let pos = try_token_kind!(
-        token,
+    let pos = peek_token!(
+        stream, token,
         Return => {
-            stream.move_after(&token);
-            return_mark = Some(parse_selected_name(stream)?);
+            stream.skip();
+            return_mark = Some(parse_type_mark(stream)?);
             start_pos.combine(&stream.expect_kind(RightSquare)?)
         },
         RightSquare => {
-            stream.move_after(&token);
+            stream.skip();
             start_pos.combine(&token.pos)
         },
         Identifier => {
@@ -37,24 +36,23 @@ pub fn parse_signature(stream: &mut TokenStream) -> ParseResult<WithPos<Signatur
 
                 match token.kind {
                     Identifier => {
-                        type_marks.push(parse_selected_name(stream)?);
-                        let sep_token = stream.expect()?;
-
-                        try_token_kind!(
+                        type_marks.push(parse_type_mark(stream)?);
+                        expect_token!(
+                            stream,
                             sep_token,
                             Comma => {},
                             RightSquare => {
                                 break start_pos.combine(&sep_token.pos);
                             },
                             Return => {
-                                return_mark = Some(parse_selected_name(stream)?);
+                                return_mark = Some(parse_type_mark(stream)?);
                                 break start_pos.combine(&stream.expect_kind(RightSquare)?);
                             }
                         )
                     }
                     _ => {
-                        stream.move_after(&token);
-                        return Err(kinds_error(token.pos, &[Identifier]))
+                        stream.skip();
+                        return Err(kinds_error(stream.pos_before(token), &[Identifier]))
                     }
                 };
             }
@@ -69,23 +67,22 @@ pub fn parse_signature(stream: &mut TokenStream) -> ParseResult<WithPos<Signatur
     Ok(WithPos::new(signature, pos))
 }
 
-fn parse_designator(stream: &mut TokenStream) -> ParseResult<WithPos<SubprogramDesignator>> {
-    let token = stream.expect()?;
-    Ok(try_token_kind!(
+fn parse_designator(stream: &TokenStream) -> ParseResult<WithPos<SubprogramDesignator>> {
+    Ok(expect_token!(
+        stream,
         token,
-        Identifier => token.expect_ident()?.map_into(SubprogramDesignator::Identifier),
-        StringLiteral => token.expect_operator_symbol()?.map_into(SubprogramDesignator::OperatorSymbol)
+        Identifier => token.to_identifier_value()?.map_into(SubprogramDesignator::Identifier),
+        StringLiteral => token.to_operator_symbol()?.map_into(SubprogramDesignator::OperatorSymbol)
     ))
 }
 
 pub fn parse_subprogram_declaration_no_semi(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<SubprogramDeclaration> {
-    let token = stream.expect()?;
-
     let (is_function, is_pure) = {
-        try_token_kind!(
+        expect_token!(
+            stream,
             token,
             Procedure => (false, false),
             Function => (true, true),
@@ -103,7 +100,7 @@ pub fn parse_subprogram_declaration_no_semi(
     let designator = parse_designator(stream)?;
 
     let parameter_list = {
-        if stream.peek_kind()? == Some(LeftPar) {
+        if stream.peek_kind() == Some(LeftPar) {
             parse_parameter_interface_list(stream, diagnostics)?
         } else {
             Vec::new()
@@ -112,7 +109,7 @@ pub fn parse_subprogram_declaration_no_semi(
 
     if is_function {
         stream.expect_kind(Return)?;
-        let return_type = parse_selected_name(stream)?;
+        let return_type = parse_type_mark(stream)?;
         Ok(SubprogramDeclaration::Function(FunctionSpecification {
             pure: is_pure,
             designator: designator.into(),
@@ -128,7 +125,7 @@ pub fn parse_subprogram_declaration_no_semi(
 }
 
 pub fn parse_subprogram_declaration(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<SubprogramDeclaration> {
     let res = parse_subprogram_declaration_no_semi(stream, diagnostics);
@@ -138,7 +135,7 @@ pub fn parse_subprogram_declaration(
 
 /// LRM 4.3 Subprogram bodies
 pub fn parse_subprogram_body(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     specification: SubprogramDeclaration,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<SubprogramBody> {
@@ -148,32 +145,41 @@ pub fn parse_subprogram_body(
             SubprogramDeclaration::Function(..) => Function,
         }
     };
-    let declarations = parse_declarative_part(stream, diagnostics, true)?;
+    let declarations = parse_declarative_part(stream, diagnostics)?;
+    stream.expect_kind(Begin)?;
 
-    let (statements, end_token) = parse_labeled_sequential_statements(stream, diagnostics)?;
-    try_token_kind!(
+    let statements = parse_labeled_sequential_statements(stream, diagnostics)?;
+    expect_token!(
+        stream,
         end_token,
         End => {
-            stream.pop_if_kind(end_kind)?;
-            stream.pop_if_kind(Identifier)?;
-            stream.pop_if_kind(StringLiteral)?;
+            stream.pop_if_kind(end_kind);
+
+            let end_ident = if matches!(stream.peek_kind(), Some(Identifier | StringLiteral)) {
+                Some(parse_designator(stream)?)
+            } else {
+                None
+            };
             stream.expect_kind(SemiColon)?;
+
+            Ok(SubprogramBody {
+                end_ident_pos: check_end_identifier_mismatch(specification.subpgm_designator(), end_ident, diagnostics),
+                specification,
+                declarations,
+                statements,
+            })
         }
-    );
-    Ok(SubprogramBody {
-        specification,
-        declarations,
-        statements,
-    })
+    )
 }
 
 pub fn parse_subprogram(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<Declaration> {
     let specification = parse_subprogram_declaration_no_semi(stream, diagnostics)?;
-    match_token_kind!(
-        stream.expect()?,
+    expect_token!(
+        stream,
+        token,
         Is => {
             Ok(Declaration::SubprogramBody(parse_subprogram_body(stream, specification, diagnostics)?))
         },
@@ -226,7 +232,7 @@ function foo return lib.foo.natural;
                     .map_into(SubprogramDesignator::Identifier)
                     .into(),
                 parameter_list: Vec::new(),
-                return_type: code.s1("lib.foo.natural").selected_name()
+                return_type: code.s1("lib.foo.natural").type_mark()
             })
         );
     }
@@ -248,7 +254,7 @@ function \"+\" return lib.foo.natural;
                 }
                 .into(),
                 parameter_list: Vec::new(),
-                return_type: code.s1("lib.foo.natural").selected_name()
+                return_type: code.s1("lib.foo.natural").type_mark()
             })
         );
     }
@@ -270,7 +276,7 @@ impure function foo return lib.foo.natural;
                     .map_into(SubprogramDesignator::Identifier)
                     .into(),
                 parameter_list: Vec::new(),
-                return_type: code.s1("lib.foo.natural").selected_name()
+                return_type: code.s1("lib.foo.natural").type_mark()
             })
         );
     }
@@ -291,7 +297,7 @@ pure function foo return lib.foo.natural;
                     .map_into(SubprogramDesignator::Identifier)
                     .into(),
                 parameter_list: Vec::new(),
-                return_type: code.s1("lib.foo.natural").selected_name()
+                return_type: code.s1("lib.foo.natural").type_mark()
             })
         );
     }
@@ -332,7 +338,7 @@ function foo(foo : natural) return lib.foo.natural;
                     .map_into(SubprogramDesignator::Identifier)
                     .into(),
                 parameter_list: vec![code.s1("foo : natural").parameter()],
-                return_type: code.s1("lib.foo.natural").selected_name()
+                return_type: code.s1("lib.foo.natural").type_mark()
             })
         );
     }
@@ -343,7 +349,7 @@ function foo(foo : natural) return lib.foo.natural;
         assert_eq!(
             code.with_stream(parse_signature),
             WithPos::new(
-                Signature::Function(vec![], code.s1("bar.type_mark").selected_name()),
+                Signature::Function(vec![], code.s1("bar.type_mark").type_mark()),
                 code.pos()
             )
         );
@@ -356,8 +362,8 @@ function foo(foo : natural) return lib.foo.natural;
             code.with_stream(parse_signature),
             WithPos::new(
                 Signature::Function(
-                    vec![code.s1("foo.type_mark").selected_name()],
-                    code.s1("bar.type_mark").selected_name()
+                    vec![code.s1("foo.type_mark").type_mark()],
+                    code.s1("bar.type_mark").type_mark()
                 ),
                 code.pos()
             )
@@ -379,7 +385,7 @@ function foo(foo : natural) return lib.foo.natural;
         assert_eq!(
             code.with_stream(parse_signature),
             WithPos::new(
-                Signature::Procedure(vec![code.s1("foo.type_mark").selected_name()]),
+                Signature::Procedure(vec![code.s1("foo.type_mark").type_mark()]),
                 code.pos()
             )
         );
@@ -393,10 +399,10 @@ function foo(foo : natural) return lib.foo.natural;
             WithPos::new(
                 Signature::Function(
                     vec![
-                        code.s1("foo.type_mark").selected_name(),
-                        code.s1("foo2.type_mark").selected_name()
+                        code.s1("foo.type_mark").type_mark(),
+                        code.s1("foo2.type_mark").type_mark()
                     ],
-                    code.s1("bar.type_mark").selected_name()
+                    code.s1("bar.type_mark").type_mark()
                 ),
                 code.pos()
             )
@@ -407,14 +413,14 @@ function foo(foo : natural) return lib.foo.natural;
     pub fn parses_function_signature_many_return_error() {
         let code = Code::new("[return bar.type_mark return");
         assert_eq!(
-            code.with_stream_err(parse_signature),
-            Diagnostic::error(code.s("return", 2), "Expected ']'")
+            code.with_partial_stream(parse_signature),
+            Err(Diagnostic::error(code.s("return", 2), "Expected ']'"))
         );
 
         let code = Code::new("[foo return bar.type_mark return");
         assert_eq!(
-            code.with_stream_err(parse_signature),
-            Diagnostic::error(code.s("return", 2), "Expected ']'")
+            code.with_partial_stream(parse_signature),
+            Err(Diagnostic::error(code.s("return", 2), "Expected ']'"))
         );
     }
 
@@ -438,6 +444,7 @@ end function;
             specification,
             declarations,
             statements,
+            end_ident_pos: None,
         };
         assert_eq!(
             code.with_stream_no_diagnostics(parse_subprogram),
@@ -458,6 +465,54 @@ function foo(arg : natural) return natural;
         assert_eq!(
             code.with_stream_no_diagnostics(parse_subprogram),
             Declaration::SubprogramDeclaration(specification)
+        );
+    }
+
+    #[test]
+    pub fn parses_subprogram_body_end_ident() {
+        let code = Code::new(
+            "\
+function foo(arg : natural) return natural is
+begin
+end function foo;
+",
+        );
+        let specification = code
+            .s1("function foo(arg : natural) return natural")
+            .subprogram_decl();
+        let body = SubprogramBody {
+            specification,
+            declarations: vec![],
+            statements: vec![],
+            end_ident_pos: Some(code.s("foo", 2).pos()),
+        };
+        assert_eq!(
+            code.with_stream_no_diagnostics(parse_subprogram),
+            Declaration::SubprogramBody(body)
+        );
+    }
+
+    #[test]
+    pub fn parses_subprogram_body_end_operator_symbol() {
+        let code = Code::new(
+            "\
+function \"+\"(arg : natural) return natural is
+begin
+end function \"+\";
+",
+        );
+        let specification = code
+            .s1("function \"+\"(arg : natural) return natural")
+            .subprogram_decl();
+        let body = SubprogramBody {
+            specification,
+            declarations: vec![],
+            statements: vec![],
+            end_ident_pos: Some(code.s("\"+\"", 2).pos()),
+        };
+        assert_eq!(
+            code.with_stream_no_diagnostics(parse_subprogram),
+            Declaration::SubprogramBody(body)
         );
     }
 }

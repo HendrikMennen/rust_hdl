@@ -34,7 +34,7 @@ impl<T, R> AnalysisLock<T, R> {
     }
 
     /// Returns an immutable reference to the data and result if it has already been analyzed.
-    fn get(&self) -> Option<ReadGuard<T, R>> {
+    pub fn get(&self) -> Option<ReadGuard<T, R>> {
         let guard = self.state.read();
         if guard.result.is_some() {
             Some(ReadGuard { guard })
@@ -126,8 +126,13 @@ pub struct WriteGuard<'a, T, R> {
 }
 
 impl<'a, T, R> WriteGuard<'a, T, R> {
-    pub fn finish(mut self, result: R) -> ReadGuard<'a, T, R> {
+    pub fn finish(&mut self, result: R) {
         self.guard.result = Some(result);
+    }
+    pub fn downgrade(self) -> ReadGuard<'a, T, R> {
+        if self.guard.result.is_none() {
+            panic!("Cannot downgrade unit without result");
+        }
         ReadGuard {
             guard: RwLockWriteGuard::downgrade(self.guard),
         }

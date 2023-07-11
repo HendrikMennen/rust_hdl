@@ -9,7 +9,10 @@
 #![allow(clippy::unneeded_field_pattern)]
 
 use super::*;
-pub use crate::analysis::HasNamedEntity;
+use crate::analysis::DesignRoot;
+use crate::analysis::EntRef;
+pub use crate::analysis::HasEntityId;
+use crate::analysis::Related;
 
 #[must_use]
 pub enum SearchResult {
@@ -27,15 +30,11 @@ pub use SearchResult::*;
 pub use SearchState::*;
 
 impl SearchState {
-    fn or_else(self, nested_fun: impl FnOnce() -> SearchResult) -> SearchResult {
+    fn or_not_found(self) -> SearchResult {
         match self {
             Finished(result) => result,
-            NotFinished => nested_fun(),
+            NotFinished => NotFound,
         }
-    }
-
-    fn or_not_found(self) -> SearchResult {
-        self.or_else(|| NotFound)
     }
 }
 
@@ -45,26 +44,30 @@ pub enum FoundDeclaration<'a> {
     ElementDeclaration(&'a mut ElementDeclaration),
     EnumerationLiteral(&'a mut Ident, &'a mut WithDecl<WithPos<EnumerationLiteral>>),
     InterfaceObject(&'a mut InterfaceObjectDeclaration),
+    InterfaceFile(&'a mut InterfaceFileDeclaration),
     File(&'a mut FileDeclaration),
     Type(&'a mut TypeDeclaration),
+    InterfaceType(&'a mut WithDecl<Ident>),
+    InterfacePackage(&'a mut InterfacePackageDeclaration),
     PhysicalTypePrimary(&'a mut WithDecl<Ident>),
     PhysicalTypeSecondary(&'a mut WithDecl<Ident>, &'a mut PhysicalLiteral),
     Component(&'a mut ComponentDeclaration),
-    //Attribute(&'a mut AttributeDeclaration),
+    Attribute(&'a mut AttributeDeclaration),
     Alias(&'a mut AliasDeclaration),
     Function(&'a mut FunctionSpecification),
     Procedure(&'a mut ProcedureSpecification),
-    Library(&'a Ident),
     Package(&'a mut PackageDeclaration),
+    PackageBody(&'a mut PackageBody),
     PackageInstance(&'a mut PackageInstantiation),
     Configuration(&'a mut ConfigurationDeclaration),
     Entity(&'a mut EntityDeclaration),
+    Architecture(&'a mut ArchitectureBody),
     Context(&'a mut ContextDeclaration),
     ForIndex(&'a mut WithDecl<Ident>, &'a mut DiscreteRange),
     ForGenerateIndex(Option<&'a Ident>, &'a mut ForGenerateStatement),
-    ConcurrentStatement(&'a mut WithDecl<Ident>),
     GenerateBody(&'a mut WithDecl<Ident>),
-    SequentialStatement(&'a mut WithDecl<Ident>),
+    ConcurrentStatement(&'a Ident, &'a mut Reference),
+    SequentialStatement(&'a Ident, &'a mut Reference),
 }
 
 pub trait Searcher {
@@ -230,14 +233,16 @@ fn search_assignment<T: Search>(
     }
 }
 
-impl Search for Choice {
+impl Search for WithPos<Choice> {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
-        match self {
+        return_if_finished!(searcher.search_with_pos(&self.pos));
+
+        match self.item {
             Choice::DiscreteRange(ref mut drange) => {
                 return_if_found!(drange.search(searcher));
             }
             Choice::Expression(ref mut expr) => {
-                return_if_found!(expr.search(searcher));
+                return_if_found!(search_pos_expr(&mut self.pos, expr, searcher));
             }
             Choice::Others => {}
         }
@@ -256,20 +261,25 @@ impl Search for WithPos<Target> {
 
 impl Search for LabeledSequentialStatement {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
-        if let Some(ref mut label) = self.label {
+        if let Some(ref ident) = self.label.tree {
             return_if_found!(searcher
-                .search_decl(FoundDeclaration::SequentialStatement(label))
+                .search_decl(FoundDeclaration::SequentialStatement(
+                    ident,
+                    &mut self.label.decl
+                ))
                 .or_not_found());
         }
-        match self.statement {
-            SequentialStatement::Return(ReturnStatement { ref mut expression }) => {
+        match self.statement.item {
+            SequentialStatement::Return(ref mut ret) => {
+                let ReturnStatement { ref mut expression } = ret;
                 return_if_found!(expression.search(searcher));
             }
             SequentialStatement::ProcedureCall(ref mut pcall) => {
-                return_if_found!(pcall.search(searcher));
+                return_if_finished!(searcher.search_with_pos(&pcall.pos));
+                return_if_found!(pcall.item.search(searcher));
             }
             SequentialStatement::If(ref mut ifstmt) => {
-                return_if_found!(search_conditionals(ifstmt, false, searcher));
+                return_if_found!(search_conditionals(&mut ifstmt.conds, false, searcher));
             }
             SequentialStatement::Wait(ref mut wait_stmt) => {
                 let WaitStatement {
@@ -297,13 +307,27 @@ impl Search for LabeledSequentialStatement {
                 return_if_found!(severity.search(searcher));
             }
             SequentialStatement::Exit(ref mut exit_stmt) => {
-                // @TODO loop label
-                let ExitStatement { condition, .. } = exit_stmt;
+                let ExitStatement {
+                    condition,
+                    loop_label,
+                } = exit_stmt;
+                if let Some(loop_label) = loop_label {
+                    return_if_found!(searcher
+                        .search_pos_with_ref(&loop_label.item.pos, &mut loop_label.reference)
+                        .or_not_found());
+                }
                 return_if_found!(condition.search(searcher));
             }
             SequentialStatement::Next(ref mut next_stmt) => {
-                // @TODO loop label
-                let NextStatement { condition, .. } = next_stmt;
+                let NextStatement {
+                    condition,
+                    loop_label,
+                } = next_stmt;
+                if let Some(loop_label) = loop_label {
+                    return_if_found!(searcher
+                        .search_pos_with_ref(&loop_label.item.pos, &mut loop_label.reference)
+                        .or_not_found());
+                }
                 return_if_found!(condition.search(searcher));
             }
             SequentialStatement::Case(ref mut case_stmt) => {
@@ -313,6 +337,7 @@ impl Search for LabeledSequentialStatement {
                 let LoopStatement {
                     iteration_scheme,
                     statements,
+                    end_label_pos: _,
                 } = loop_stmt;
                 match iteration_scheme {
                     Some(IterationScheme::For(ref mut index, ref mut drange)) => {
@@ -357,6 +382,13 @@ impl Search for LabeledSequentialStatement {
             }
             SequentialStatement::Null => {}
         }
+
+        if let Some(end_label_pos) = self.statement.item.end_label_pos() {
+            return_if_found!(searcher
+                .search_pos_with_ref(end_label_pos, &mut self.label.decl)
+                .or_not_found());
+        }
+
         NotFound
     }
 }
@@ -367,6 +399,7 @@ impl Search for GenerateBody {
             alternative_label,
             decl,
             statements,
+            end_label_pos,
         } = self;
         if let Some(ref mut label) = alternative_label {
             return_if_found!(searcher
@@ -374,15 +407,33 @@ impl Search for GenerateBody {
                 .or_not_found());
         }
         return_if_found!(decl.search(searcher));
-        statements.search(searcher)
+        return_if_found!(statements.search(searcher));
+
+        if let Some(ref mut label) = alternative_label {
+            if let Some(end_label_pos) = end_label_pos {
+                return_if_found!(searcher
+                    .search_pos_with_ref(end_label_pos, &mut label.decl)
+                    .or_not_found());
+            }
+        }
+
+        NotFound
     }
 }
 
 impl Search for InstantiationStatement {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
         match self.unit {
-            InstantiatedUnit::Entity(ref mut ent_name, _) => {
+            InstantiatedUnit::Entity(ref mut ent_name, ref mut architecture_name) => {
                 return_if_found!(ent_name.search(searcher));
+                if let Some(ref mut architecture_name) = architecture_name {
+                    return_if_found!(searcher
+                        .search_pos_with_ref(
+                            &architecture_name.item.pos,
+                            &mut architecture_name.reference
+                        )
+                        .or_not_found());
+                }
             }
             InstantiatedUnit::Component(ref mut component_name) => {
                 return_if_found!(component_name.search(searcher));
@@ -409,16 +460,19 @@ impl Search for SensitivityList {
 
 impl Search for LabeledConcurrentStatement {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
-        if let Some(ref mut label) = self.label {
+        if let Some(ref ident) = self.label.tree {
             return_if_found!(searcher
-                .search_decl(FoundDeclaration::ConcurrentStatement(label))
+                .search_decl(FoundDeclaration::ConcurrentStatement(
+                    ident,
+                    &mut self.label.decl
+                ))
                 .or_not_found());
         }
-        match self.statement {
+        match self.statement.item {
             ConcurrentStatement::Block(ref mut block) => {
                 // @TODO guard condition
                 return_if_found!(block.decl.search(searcher));
-                block.statements.search(searcher)
+                return_if_found!(block.statements.search(searcher));
             }
             ConcurrentStatement::Process(ref mut process) => {
                 let ProcessStatement {
@@ -426,15 +480,16 @@ impl Search for LabeledConcurrentStatement {
                     sensitivity_list,
                     decl,
                     statements,
+                    end_label_pos: _,
                 } = process;
                 return_if_found!(sensitivity_list.search(searcher));
                 return_if_found!(decl.search(searcher));
-                statements.search(searcher)
+                return_if_found!(statements.search(searcher));
             }
             ConcurrentStatement::ForGenerate(ref mut gen) => {
                 return_if_found!(searcher
                     .search_decl(FoundDeclaration::ForGenerateIndex(
-                        self.label.as_ref().map(|l| &l.tree),
+                        self.label.tree.as_ref(),
                         gen
                     ))
                     .or_not_found());
@@ -442,29 +497,31 @@ impl Search for LabeledConcurrentStatement {
                     index_name: _,
                     discrete_range,
                     body,
+                    end_label_pos: _,
                 } = gen;
                 return_if_found!(discrete_range.search(searcher));
-                body.search(searcher)
+                return_if_found!(body.search(searcher));
             }
             ConcurrentStatement::IfGenerate(ref mut gen) => {
-                search_conditionals(gen, false, searcher)
+                return_if_found!(search_conditionals(&mut gen.conds, false, searcher));
             }
             ConcurrentStatement::CaseGenerate(ref mut gen) => {
-                search_selection(gen, false, searcher)
+                return_if_found!(search_selection(&mut gen.sels, false, searcher));
             }
-            ConcurrentStatement::Instance(ref mut inst) => inst.search(searcher),
+            ConcurrentStatement::Instance(ref mut inst) => {
+                return_if_found!(inst.search(searcher));
+            }
             ConcurrentStatement::Assignment(ref mut assign) => {
                 let ConcurrentSignalAssignment { target, rhs, .. } = assign;
                 return_if_found!(search_assignment(target, rhs, searcher));
-                NotFound
             }
             ConcurrentStatement::ProcedureCall(ref mut pcall) => {
                 let ConcurrentProcedureCall {
                     postponed: _postponed,
                     call,
                 } = pcall;
-                return_if_found!(call.search(searcher));
-                NotFound
+                return_if_finished!(searcher.search_with_pos(&call.pos));
+                return_if_found!(call.item.search(searcher));
             }
             ConcurrentStatement::Assert(ref mut assert) => {
                 let ConcurrentAssertStatement {
@@ -479,9 +536,16 @@ impl Search for LabeledConcurrentStatement {
                 return_if_found!(condition.search(searcher));
                 return_if_found!(report.search(searcher));
                 return_if_found!(severity.search(searcher));
-                NotFound
             }
+        };
+
+        if let Some(end_label_pos) = self.statement.item.end_label_pos() {
+            return_if_found!(searcher
+                .search_pos_with_ref(end_label_pos, &mut self.label.decl)
+                .or_not_found());
         }
+
+        NotFound
     }
 }
 
@@ -528,17 +592,12 @@ fn search_pos_name(
         Name::Designator(ref mut designator) => searcher
             .search_designator_ref(pos, designator)
             .or_not_found(),
-        Name::Indexed(ref mut prefix, ref mut indexes) => {
-            return_if_found!(prefix.search(searcher));
-            return_if_found!(indexes.search(searcher));
-            NotFound
-        }
         Name::Slice(ref mut prefix, ref mut dranges) => {
             return_if_found!(prefix.search(searcher));
             return_if_found!(dranges.search(searcher));
             NotFound
         }
-        Name::FunctionCall(ref mut fcall) => fcall.search(searcher),
+        Name::CallOrIndexed(ref mut fcall) => fcall.search(searcher),
         Name::Attribute(ref mut attr) => {
             // @TODO more
             let AttributeName { name, expr, .. } = attr.as_mut();
@@ -669,18 +728,12 @@ impl Search for DiscreteRange {
 
 impl Search for TypeDeclaration {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
-        if !matches!(self.def, TypeDefinition::ProtectedBody(_)) {
-            return_if_found!(searcher
-                .search_decl(FoundDeclaration::Type(self))
-                .or_not_found());
-        }
+        return_if_found!(searcher
+            .search_decl(FoundDeclaration::Type(self))
+            .or_not_found());
 
         match self.def {
             TypeDefinition::ProtectedBody(ref mut body) => {
-                // Protected type body is not considered a declaration
-                return_if_found!(searcher
-                    .search_pos_with_ref(self.ident.pos(), &mut body.type_reference)
-                    .or_not_found());
                 return_if_found!(body.decl.search(searcher));
             }
             TypeDefinition::Protected(ref mut prot_decl) => {
@@ -719,7 +772,7 @@ impl Search for TypeDeclaration {
             TypeDefinition::Subtype(ref mut subtype_indication) => {
                 return_if_found!(subtype_indication.search(searcher));
             }
-            TypeDefinition::Integer(ref mut range) => {
+            TypeDefinition::Numeric(ref mut range) => {
                 return_if_found!(range.search(searcher));
             }
             TypeDefinition::File(ref mut type_mark) => {
@@ -843,9 +896,9 @@ impl Search for AssociationElement {
     }
 }
 
-impl Search for FunctionCall {
+impl Search for CallOrIndexed {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
-        let FunctionCall { name, parameters } = self;
+        let CallOrIndexed { name, parameters } = self;
         return_if_found!(name.search(searcher));
         return_if_found!(parameters.search(searcher));
         NotFound
@@ -915,12 +968,42 @@ impl Search for Declaration {
                 return_if_found!(body.specification.search(searcher));
                 return_if_found!(body.declarations.search(searcher));
                 return_if_found!(body.statements.search(searcher));
+                if let Some(ref end_ident_pos) = body.end_ident_pos {
+                    return_if_found!(searcher
+                        .search_pos_with_ref(end_ident_pos, body.specification.reference_mut())
+                        .or_not_found());
+                }
             }
             Declaration::SubprogramDeclaration(decl) => {
                 return_if_found!(decl.search(searcher));
             }
             Declaration::Attribute(Attribute::Declaration(decl)) => {
+                return_if_found!(searcher
+                    .search_decl(FoundDeclaration::Attribute(decl))
+                    .or_not_found());
                 return_if_found!(decl.type_mark.search(searcher));
+            }
+            Declaration::Attribute(Attribute::Specification(AttributeSpecification {
+                ident,
+                entity_name,
+                entity_class: _,
+                expr,
+            })) => {
+                return_if_found!(searcher.search_ident_ref(ident).or_not_found());
+                if let EntityName::Name(EntityTag {
+                    designator,
+                    signature,
+                }) = entity_name
+                {
+                    return_if_found!(searcher
+                        .search_pos_with_ref(&designator.pos, &mut designator.item.reference)
+                        .or_not_found());
+                    if let Some(signature) = signature {
+                        return_if_found!(signature.item.search(searcher));
+                    }
+                }
+
+                return_if_found!(expr.search(searcher));
             }
             Declaration::Alias(alias) => {
                 return_if_found!(searcher
@@ -939,9 +1022,8 @@ impl Search for Declaration {
                 }
             }
             Declaration::Use(use_clause) => {
-                return_if_found!(searcher
-                    .search_with_pos(&use_clause.pos)
-                    .or_else(|| use_clause.item.name_list.search(searcher)));
+                return_if_found!(searcher.search_with_pos(&use_clause.pos).or_not_found());
+                return_if_found!(use_clause.item.name_list.search(searcher));
             }
             Declaration::Component(component) => {
                 return_if_found!(searcher
@@ -951,6 +1033,7 @@ impl Search for Declaration {
                     ident: _,
                     generic_list,
                     port_list,
+                    end_ident_pos: _,
                 } = component;
                 return_if_found!(generic_list.search(searcher));
                 return_if_found!(port_list.search(searcher));
@@ -971,8 +1054,13 @@ impl Search for Declaration {
                 return_if_found!(file_name.search(searcher));
             }
 
-            // @TODO more
-            _ => {}
+            Declaration::Package(ref mut package_instance) => {
+                return_if_found!(package_instance.search(searcher));
+            }
+
+            Declaration::Configuration(_) => {
+                // @TODO
+            }
         }
         NotFound
     }
@@ -988,10 +1076,52 @@ impl Search for InterfaceDeclaration {
                 return_if_found!(decl.subtype_indication.search(searcher));
                 return_if_found!(decl.expression.search(searcher));
             }
-            InterfaceDeclaration::Subprogram(ref mut decl, _) => {
-                return_if_found!(decl.search(searcher));
+            InterfaceDeclaration::Subprogram(ref mut decl, ref mut subpgm_default) => {
+                match decl {
+                    SubprogramDeclaration::Function(f) => {
+                        return_if_found!(searcher
+                            .search_decl(FoundDeclaration::Function(f))
+                            .or_not_found());
+                    }
+                    SubprogramDeclaration::Procedure(p) => {
+                        return_if_found!(searcher
+                            .search_decl(FoundDeclaration::Procedure(p))
+                            .or_not_found());
+                    }
+                }
+
+                if let Some(subpgm_default) = subpgm_default {
+                    match subpgm_default {
+                        SubprogramDefault::Name(selected_name) => {
+                            return_if_found!(selected_name.search(searcher));
+                        }
+                        SubprogramDefault::Box => {}
+                    }
+                }
             }
-            _ => {}
+            InterfaceDeclaration::Type(decl) => {
+                return_if_found!(searcher
+                    .search_decl(FoundDeclaration::InterfaceType(decl))
+                    .or_not_found());
+            }
+            InterfaceDeclaration::Package(package_instance) => {
+                return_if_found!(searcher
+                    .search_decl(FoundDeclaration::InterfacePackage(package_instance))
+                    .or_not_found());
+                return_if_found!(package_instance.package_name.search(searcher));
+                match package_instance.generic_map {
+                    InterfacePackageGenericMapAspect::Map(ref mut generic_map) => {
+                        return_if_found!(generic_map.search(searcher));
+                    }
+                    InterfacePackageGenericMapAspect::Box => {}
+                    InterfacePackageGenericMapAspect::Default => {}
+                }
+            }
+            InterfaceDeclaration::File(decl) => {
+                return_if_found!(searcher
+                    .search_decl(FoundDeclaration::InterfaceFile(decl))
+                    .or_not_found());
+            }
         };
         NotFound
     }
@@ -1034,7 +1164,7 @@ impl Search for LibraryClause {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
         for name in self.name_list.iter_mut() {
             return_if_found!(searcher
-                .search_decl(FoundDeclaration::Library(name))
+                .search_pos_with_ref(&name.item.pos, &mut name.reference)
                 .or_not_found());
         }
         NotFound
@@ -1098,6 +1228,9 @@ impl Search for ArchitectureBody {
         return_if_found!(searcher
             .search_ident_ref(&mut self.entity_name)
             .or_not_found());
+        return_if_found!(searcher
+            .search_decl(FoundDeclaration::Architecture(self))
+            .or_not_found());
         return_if_found!(self.decl.search(searcher));
         self.statements.search(searcher)
     }
@@ -1119,7 +1252,9 @@ impl Search for PackageBody {
     fn search(&mut self, searcher: &mut impl Searcher) -> SearchResult {
         return_if_finished!(searcher.search_source(self.source()));
         return_if_found!(self.context_clause.search(searcher));
-        return_if_found!(searcher.search_ident_ref(&mut self.ident).or_not_found());
+        return_if_found!(searcher
+            .search_decl(FoundDeclaration::PackageBody(self))
+            .or_not_found());
         self.decl.search(searcher)
     }
 }
@@ -1131,6 +1266,7 @@ impl Search for PackageInstantiation {
         return_if_found!(searcher
             .search_decl(FoundDeclaration::PackageInstance(self))
             .or_not_found());
+        return_if_found!(self.generic_map.search(searcher));
         self.package_name.search(searcher)
     }
 }
@@ -1162,6 +1298,7 @@ impl Search for CaseStatement {
             is_matching: _,
             expression,
             alternatives,
+            end_label_pos: _,
         } = self;
         return_if_found!(expression.search(searcher));
         return_if_found!(search_alternatives(alternatives, false, searcher));
@@ -1173,7 +1310,7 @@ impl Search for CaseStatement {
 pub struct ItemAtCursor {
     source: Source,
     cursor: Position,
-    pub result: Option<Arc<NamedEntity>>,
+    pub result: Option<(SrcPos, EntityId)>,
 }
 
 impl ItemAtCursor {
@@ -1190,6 +1327,19 @@ impl ItemAtCursor {
         // Thus cursor will match character cursor and cursor + 1
         pos.start() <= self.cursor && self.cursor <= pos.end()
     }
+
+    fn search_decl_pos(&mut self, pos: &SrcPos, decl: &FoundDeclaration) -> SearchState {
+        if self.is_inside(pos) {
+            if let Some(id) = decl.ent_id() {
+                self.result = Some((pos.clone(), id));
+                Finished(Found)
+            } else {
+                Finished(NotFound)
+            }
+        } else {
+            NotFinished
+        }
+    }
 }
 
 impl Searcher for ItemAtCursor {
@@ -1205,13 +1355,12 @@ impl Searcher for ItemAtCursor {
 
     fn search_decl(&mut self, decl: FoundDeclaration) -> SearchState {
         let pos = decl.pos();
-        if self.is_inside(pos) {
-            if let Some(ent) = decl.named_entity() {
-                self.result = Some(ent.clone());
-                Finished(Found)
-            } else {
-                Finished(NotFound)
-            }
+        if let Finished(res) = self.search_decl_pos(pos, &decl) {
+            return Finished(res);
+        }
+
+        if let Some(end_pos) = decl.end_ident_pos() {
+            self.search_decl_pos(end_pos, &decl)
         } else {
             NotFinished
         }
@@ -1219,8 +1368,8 @@ impl Searcher for ItemAtCursor {
 
     fn search_pos_with_ref(&mut self, pos: &SrcPos, reference: &mut Reference) -> SearchState {
         if self.is_inside(pos) {
-            if let Some(ent) = reference {
-                self.result = Some(ent.clone());
+            if let Some(id) = reference {
+                self.result = Some((pos.clone(), *id));
                 Finished(Found)
             } else {
                 Finished(NotFound)
@@ -1240,37 +1389,95 @@ impl Searcher for ItemAtCursor {
     }
 }
 
+// Search for reference to declaration/definition at cursor
+pub struct FindEnt<'a, T: Fn(EntRef<'a>) -> bool> {
+    root: &'a DesignRoot,
+    cond: T,
+    pub result: Option<EntRef<'a>>,
+}
+
+impl<'a, T: Fn(EntRef<'a>) -> bool> FindEnt<'a, T> {
+    pub fn new(root: &'a DesignRoot, cond: T) -> FindEnt<'a, T> {
+        FindEnt {
+            root,
+            cond,
+            result: None,
+        }
+    }
+}
+
+impl<'a, T: Fn(EntRef<'a>) -> bool> Searcher for FindEnt<'a, T> {
+    fn search_decl(&mut self, decl: FoundDeclaration) -> SearchState {
+        if let Some(id) = decl.ent_id() {
+            let ent = self.root.get_ent(id);
+            if (self.cond)(ent) {
+                self.result = Some(ent);
+                return SearchState::Finished(SearchResult::Found);
+            }
+        }
+
+        SearchState::NotFinished
+    }
+}
+
+pub struct FindAllEnt<'a, T: FnMut(EntRef<'a>) -> bool> {
+    root: &'a DesignRoot,
+    cond: T,
+    pub result: Vec<EntRef<'a>>,
+}
+
+impl<'a, T: FnMut(EntRef<'a>) -> bool> FindAllEnt<'a, T> {
+    pub fn new(root: &'a DesignRoot, cond: T) -> FindAllEnt<'a, T> {
+        FindAllEnt {
+            root,
+            cond,
+            result: Vec::default(),
+        }
+    }
+}
+
+impl<'a, T: FnMut(EntRef<'a>) -> bool> Searcher for FindAllEnt<'a, T> {
+    fn search_decl(&mut self, decl: FoundDeclaration) -> SearchState {
+        if let Some(id) = decl.ent_id() {
+            let ent = self.root.get_ent(id);
+            if (self.cond)(ent) {
+                self.result.push(ent);
+            }
+        }
+
+        SearchState::NotFinished
+    }
+}
+
 // Search for a declaration/definition and format it
-pub struct FormatDeclaration {
-    ent: Arc<NamedEntity>,
+pub struct FormatDeclaration<'a> {
+    ent: EntRef<'a>,
     pub result: Option<String>,
 }
 
-impl FormatDeclaration {
-    pub fn new(ent: Arc<NamedEntity>) -> FormatDeclaration {
+impl<'a> FormatDeclaration<'a> {
+    pub fn new(ent: EntRef<'a>) -> FormatDeclaration<'a> {
         FormatDeclaration { ent, result: None }
     }
 }
 
-impl Searcher for FormatDeclaration {
+impl<'a> Searcher for FormatDeclaration<'a> {
     fn search_decl(&mut self, decl: FoundDeclaration) -> SearchState {
-        let ent = if let Some(ent) = decl.named_entity() {
-            ent
+        let id = if let Some(id) = decl.ent_id() {
+            id
         } else {
             return NotFinished;
         };
 
-        if let Some(ref implicit_of) = self.ent.implicit_of {
+        if is_implicit_of(self.ent, id) {
             // Implicit
-            if implicit_of.id() == ent.id() {
-                self.result = Some(format!(
-                    "-- {}\n\n-- Implicitly defined by:\n{}\n",
-                    self.ent.describe(),
-                    decl,
-                ));
-                return Finished(Found);
-            }
-        } else if self.ent.id() == ent.id() {
+            self.result = Some(format!(
+                "-- {}\n\n-- Implicitly defined by:\n{}\n",
+                self.ent.describe(),
+                decl,
+            ));
+            return Finished(Found);
+        } else if self.ent.id() == id {
             // Explicit
             self.result = Some(decl.to_string());
             return Finished(Found);
@@ -1280,33 +1487,89 @@ impl Searcher for FormatDeclaration {
 }
 
 // Search for all references to declaration/definition
-pub struct FindAllReferences {
-    ent: Arc<NamedEntity>,
+pub struct FindAllReferences<'a> {
+    root: &'a DesignRoot,
+    ent: EntRef<'a>,
     pub references: Vec<SrcPos>,
 }
 
-impl FindAllReferences {
-    pub fn new(ent: Arc<NamedEntity>) -> FindAllReferences {
+fn is_instance_of(ent: EntRef, other: EntRef) -> bool {
+    if let Related::InstanceOf(ent) = ent.related {
+        if ent.id() == other.id() {
+            return true;
+        }
+
+        if is_instance_of(ent, other) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_declared_by(ent: EntRef, other: EntRef) -> bool {
+    if let Related::DeclaredBy(ent) = ent.related {
+        if ent.id() == other.id() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_implicit_of(ent: EntRef, id: EntityId) -> bool {
+    match ent.related {
+        Related::ImplicitOf(ent) => ent.id() == id,
+        Related::InstanceOf(ent) => is_implicit_of(ent, id),
+        Related::None => false,
+        Related::DeclaredBy(_) => false,
+    }
+}
+
+fn is_reference(ent: EntRef, other: EntRef) -> bool {
+    if ent.id() == other.id() {
+        return true;
+    }
+
+    if is_instance_of(ent, other) || is_instance_of(other, ent) {
+        return true;
+    }
+
+    if is_declared_by(ent, other) || is_declared_by(other, ent) {
+        return true;
+    }
+
+    false
+}
+impl<'a> FindAllReferences<'a> {
+    pub fn new(root: &'a DesignRoot, ent: EntRef<'a>) -> FindAllReferences<'a> {
         FindAllReferences {
+            root,
             ent,
             references: Vec::new(),
         }
     }
 }
 
-impl Searcher for FindAllReferences {
+impl<'a> Searcher for FindAllReferences<'a> {
     fn search_decl(&mut self, decl: FoundDeclaration) -> SearchState {
-        if let Some(ent) = decl.named_entity() {
-            if self.ent.id() == ent.id() {
+        if let Some(id) = decl.ent_id() {
+            let other = self.root.get_ent(id);
+
+            if is_reference(self.ent, other) {
                 self.references.push(decl.pos().clone());
+                if let Some(pos) = decl.end_ident_pos() {
+                    self.references.push(pos.clone());
+                }
             }
         }
         NotFinished
     }
 
     fn search_pos_with_ref(&mut self, pos: &SrcPos, reference: &mut Reference) -> SearchState {
-        if let Some(ent) = reference.as_ref() {
-            if self.ent.id() == ent.id() {
+        if let Some(id) = reference.as_ref() {
+            let other = self.root.get_ent(*id);
+            if is_reference(self.ent, other) {
                 self.references.push(pos.clone());
             }
         };
@@ -1314,32 +1577,72 @@ impl Searcher for FindAllReferences {
     }
 }
 
-impl<'a> HasNamedEntity for FoundDeclaration<'a> {
-    fn named_entity(&self) -> Option<&Arc<NamedEntity>> {
+impl<'a> FoundDeclaration<'a> {
+    fn end_ident_pos(&self) -> Option<&SrcPos> {
         match self {
-            FoundDeclaration::InterfaceObject(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::ForIndex(ident, _) => ident.decl.as_ref(),
-            FoundDeclaration::ForGenerateIndex(_, value) => value.index_name.decl.as_ref(),
-            FoundDeclaration::Library(_) => None,
-            FoundDeclaration::Function(value) => value.designator.decl.as_ref(),
-            FoundDeclaration::Procedure(value) => value.designator.decl.as_ref(),
-            FoundDeclaration::Object(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::ElementDeclaration(elem) => elem.ident.decl.as_ref(),
-            FoundDeclaration::EnumerationLiteral(_, elem) => elem.decl.as_ref(),
-            FoundDeclaration::File(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::Type(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::PhysicalTypePrimary(value) => value.decl.as_ref(),
-            FoundDeclaration::PhysicalTypeSecondary(value, _) => value.decl.as_ref(),
-            FoundDeclaration::Component(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::Alias(value) => value.designator.decl.as_ref(),
-            FoundDeclaration::Package(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::PackageInstance(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::Configuration(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::Entity(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::Context(value) => value.ident.decl.as_ref(),
-            FoundDeclaration::GenerateBody(value) => value.decl.as_ref(),
-            FoundDeclaration::ConcurrentStatement(value) => value.decl.as_ref(),
-            FoundDeclaration::SequentialStatement(value) => value.decl.as_ref(),
+            FoundDeclaration::InterfaceObject(_) => None,
+            FoundDeclaration::ForIndex(..) => None,
+            FoundDeclaration::ForGenerateIndex(..) => None,
+            FoundDeclaration::Function(..) => None,
+            FoundDeclaration::Procedure(..) => None,
+            FoundDeclaration::Object(..) => None,
+            FoundDeclaration::ElementDeclaration(..) => None,
+            FoundDeclaration::EnumerationLiteral(..) => None,
+            FoundDeclaration::File(..) => None,
+            FoundDeclaration::Type(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::InterfaceType(..) => None,
+            FoundDeclaration::InterfacePackage(..) => None,
+            FoundDeclaration::InterfaceFile(..) => None,
+            FoundDeclaration::PhysicalTypePrimary(..) => None,
+            FoundDeclaration::PhysicalTypeSecondary(..) => None,
+            FoundDeclaration::Component(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::Attribute(..) => None,
+            FoundDeclaration::Alias(..) => None,
+            FoundDeclaration::Package(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::PackageBody(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::PackageInstance(..) => None,
+            FoundDeclaration::Configuration(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::Entity(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::Architecture(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::Context(value) => value.end_ident_pos.as_ref(),
+            FoundDeclaration::GenerateBody(..) => None,
+            FoundDeclaration::ConcurrentStatement(..) => None,
+            FoundDeclaration::SequentialStatement(..) => None,
+        }
+    }
+}
+
+impl<'a> HasEntityId for FoundDeclaration<'a> {
+    fn ent_id(&self) -> Option<EntityId> {
+        match self {
+            FoundDeclaration::InterfaceObject(value) => value.ident.decl,
+            FoundDeclaration::ForIndex(ident, _) => ident.decl,
+            FoundDeclaration::ForGenerateIndex(_, value) => value.index_name.decl,
+            FoundDeclaration::Function(value) => value.designator.decl,
+            FoundDeclaration::Procedure(value) => value.designator.decl,
+            FoundDeclaration::Object(value) => value.ident.decl,
+            FoundDeclaration::ElementDeclaration(elem) => elem.ident.decl,
+            FoundDeclaration::EnumerationLiteral(_, elem) => elem.decl,
+            FoundDeclaration::File(value) => value.ident.decl,
+            FoundDeclaration::Type(value) => value.ident.decl,
+            FoundDeclaration::InterfaceType(value) => value.decl,
+            FoundDeclaration::InterfacePackage(value) => value.ident.decl,
+            FoundDeclaration::InterfaceFile(value) => value.ident.decl,
+            FoundDeclaration::PhysicalTypePrimary(value) => value.decl,
+            FoundDeclaration::PhysicalTypeSecondary(value, _) => value.decl,
+            FoundDeclaration::Component(value) => value.ident.decl,
+            FoundDeclaration::Attribute(value) => value.ident.decl,
+            FoundDeclaration::Alias(value) => value.designator.decl,
+            FoundDeclaration::Package(value) => value.ident.decl,
+            FoundDeclaration::PackageBody(value) => value.ident.decl,
+            FoundDeclaration::PackageInstance(value) => value.ident.decl,
+            FoundDeclaration::Configuration(value) => value.ident.decl,
+            FoundDeclaration::Entity(value) => value.ident.decl,
+            FoundDeclaration::Architecture(value) => value.ident.decl,
+            FoundDeclaration::Context(value) => value.ident.decl,
+            FoundDeclaration::GenerateBody(value) => value.decl,
+            FoundDeclaration::ConcurrentStatement(_, value) => **value,
+            FoundDeclaration::SequentialStatement(_, value) => **value,
         }
     }
 }
@@ -1350,7 +1653,6 @@ impl<'a> HasSrcPos for FoundDeclaration<'a> {
             FoundDeclaration::InterfaceObject(value) => value.ident.pos(),
             FoundDeclaration::ForIndex(ident, _) => ident.pos(),
             FoundDeclaration::ForGenerateIndex(_, value) => value.index_name.pos(),
-            FoundDeclaration::Library(value) => value.pos(),
             FoundDeclaration::Function(value) => &value.designator.tree.pos,
             FoundDeclaration::Procedure(value) => &value.designator.tree.pos,
             FoundDeclaration::Object(value) => value.ident.pos(),
@@ -1358,18 +1660,24 @@ impl<'a> HasSrcPos for FoundDeclaration<'a> {
             FoundDeclaration::EnumerationLiteral(_, elem) => &elem.tree.pos,
             FoundDeclaration::File(value) => value.ident.pos(),
             FoundDeclaration::Type(value) => value.ident.pos(),
+            FoundDeclaration::InterfaceType(value) => value.pos(),
+            FoundDeclaration::InterfacePackage(value) => value.ident.pos(),
+            FoundDeclaration::InterfaceFile(value) => value.ident.pos(),
             FoundDeclaration::PhysicalTypePrimary(value) => value.pos(),
             FoundDeclaration::PhysicalTypeSecondary(value, _) => value.as_ref(),
             FoundDeclaration::Component(value) => value.ident.pos(),
             FoundDeclaration::Alias(value) => &value.designator.tree.pos,
+            FoundDeclaration::Attribute(value) => value.ident.pos(),
             FoundDeclaration::Package(value) => value.ident.pos(),
+            FoundDeclaration::PackageBody(value) => value.ident.pos(),
             FoundDeclaration::PackageInstance(value) => value.ident.pos(),
             FoundDeclaration::Configuration(value) => value.ident.pos(),
             FoundDeclaration::Entity(value) => value.ident.pos(),
+            FoundDeclaration::Architecture(value) => value.ident.pos(),
             FoundDeclaration::Context(value) => value.ident.pos(),
             FoundDeclaration::GenerateBody(value) => value.pos(),
-            FoundDeclaration::ConcurrentStatement(value) => value.pos(),
-            FoundDeclaration::SequentialStatement(value) => value.pos(),
+            FoundDeclaration::ConcurrentStatement(value, _) => value.pos(),
+            FoundDeclaration::SequentialStatement(value, _) => value.pos(),
         }
     }
 }
@@ -1378,76 +1686,92 @@ impl std::fmt::Display for FoundDeclaration<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FoundDeclaration::InterfaceObject(ref value) => match value.list_type {
-                InterfaceListType::Port => write!(f, "port {};", value),
-                InterfaceListType::Generic => write!(f, "generic {};", value),
-                InterfaceListType::Parameter => write!(f, "{};", value),
+                InterfaceType::Port => write!(f, "port {value};"),
+                InterfaceType::Generic => write!(f, "generic {value};"),
+                InterfaceType::Parameter => write!(f, "{value};"),
             },
             FoundDeclaration::ForIndex(ref ident, ref drange) => {
-                write!(f, "for {} in {} loop", ident, drange)
+                write!(f, "for {ident} in {drange} loop")
             }
             FoundDeclaration::ForGenerateIndex(ref ident, ref value) => match ident {
-                Some(ident) => write!(f, "{}: {}", ident, value),
-                None => write!(f, "{}", value),
+                Some(ident) => write!(f, "{ident}: {value}"),
+                None => write!(f, "{value}"),
             },
-            FoundDeclaration::Library(ref value) => {
-                write!(f, "library {};", value)
-            }
             FoundDeclaration::Function(ref value) => {
-                write!(f, "{};", value)
+                write!(f, "{value};")
             }
             FoundDeclaration::Procedure(ref value) => {
-                write!(f, "{};", value)
+                write!(f, "{value};")
             }
             FoundDeclaration::Object(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::ElementDeclaration(elem) => {
-                write!(f, "{}", elem)
+                write!(f, "{elem}")
             }
             FoundDeclaration::EnumerationLiteral(ident, elem) => {
-                write!(f, "{} : {}", elem, ident)
+                write!(f, "{elem} : {ident}")
             }
             FoundDeclaration::File(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::PhysicalTypePrimary(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::PhysicalTypeSecondary(_, ref literal) => {
-                write!(f, "{}", literal)
+                write!(f, "{literal}")
             }
             FoundDeclaration::Type(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
+            }
+            FoundDeclaration::InterfaceType(ref value) => {
+                write!(f, "type {value}")
+            }
+            FoundDeclaration::InterfacePackage(value) => {
+                write!(f, "{value}")
+            }
+            FoundDeclaration::InterfaceFile(value) => {
+                write!(f, "{value}")
             }
             FoundDeclaration::Component(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::Alias(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
+            }
+            FoundDeclaration::Attribute(ref value) => {
+                write!(f, "{value}")
             }
             FoundDeclaration::Package(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
+            }
+            FoundDeclaration::PackageBody(ref value) => {
+                // Will never be shown has hover will goto the declaration
+                write!(f, "package body {}", value.name())
             }
             FoundDeclaration::PackageInstance(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::Configuration(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::Entity(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
+            }
+            FoundDeclaration::Architecture(value) => {
+                write!(f, "architecture {} of {}", value.ident(), value.entity_name)
             }
             FoundDeclaration::Context(ref value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
             FoundDeclaration::GenerateBody(value) => {
-                write!(f, "{}", value)
+                write!(f, "{value}")
             }
-            FoundDeclaration::ConcurrentStatement(value) => {
-                write!(f, "{}", value)
+            FoundDeclaration::ConcurrentStatement(value, _) => {
+                write!(f, "{value}")
             }
-            FoundDeclaration::SequentialStatement(value) => {
-                write!(f, "{}", value)
+            FoundDeclaration::SequentialStatement(value, _) => {
+                write!(f, "{value}")
             }
         }
     }
@@ -1480,5 +1804,21 @@ pub fn clear_references(tree: &mut impl Search) {
     }
 
     let mut searcher = ReferenceClearer;
+    let _ = tree.search(&mut searcher);
+}
+
+#[cfg(test)]
+pub fn check_no_unresolved(tree: &mut impl Search) {
+    #[derive(Default)]
+    struct CheckNoUnresolved;
+
+    impl Searcher for CheckNoUnresolved {
+        fn search_pos_with_ref(&mut self, _pos: &SrcPos, reference: &mut Reference) -> SearchState {
+            assert!(reference.is_some());
+            NotFinished
+        }
+    }
+
+    let mut searcher = CheckNoUnresolved;
     let _ = tree.search(&mut searcher);
 }

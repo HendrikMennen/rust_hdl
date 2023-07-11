@@ -6,6 +6,7 @@
 
 //! Name conversions
 use super::*;
+use crate::analysis::{Concurrent, Sequential};
 use crate::data::*;
 
 impl From<WithPos<SelectedName>> for WithPos<Name> {
@@ -42,8 +43,7 @@ impl WithPos<Name> {
             Name::Selected(_, ref suffix) => &suffix.pos,
             // @TODO add pos of .all?
             Name::SelectedAll(ref prefix) => &prefix.pos,
-            Name::FunctionCall(ref fcall) => fcall.name.suffix_pos(),
-            Name::Indexed(ref prefix, ..) => prefix.suffix_pos(),
+            Name::CallOrIndexed(ref fcall) => fcall.name.suffix_pos(),
             Name::Slice(ref prefix, ..) => prefix.suffix_pos(),
             Name::Attribute(ref attr, ..) => attr.name.suffix_pos(),
             Name::External(..) => &self.pos,
@@ -162,13 +162,13 @@ impl HasIdent for PackageDeclaration {
 
 impl HasIdent for PackageBody {
     fn ident(&self) -> &Ident {
-        &self.ident.item
+        &self.ident.tree
     }
 }
 
 impl HasIdent for ArchitectureBody {
     fn ident(&self) -> &Ident {
-        &self.ident
+        self.ident.ident()
     }
 }
 
@@ -246,7 +246,7 @@ impl HasPrimaryIdent for ArchitectureBody {
 
 impl HasPrimaryIdent for PackageBody {
     fn primary_ident(&self) -> &Ident {
-        &self.ident.item
+        &self.ident.tree
     }
 }
 
@@ -328,18 +328,28 @@ impl Designator {
 
     pub fn describe(&self) -> String {
         match self {
-            Designator::Character(chr) => format!("'{}'", chr),
-            Designator::Identifier(ident) => format!("'{}'", ident),
-            Designator::OperatorSymbol(op) => format!("operator \"{}\"", op),
+            Designator::Character(chr) => format!("'{chr}'"),
+            Designator::Identifier(ident) => format!("'{ident}'"),
+            Designator::OperatorSymbol(op) => format!("operator \"{op}\""),
+            Designator::Anonymous(_) => "<anonymous>".to_owned(),
         }
     }
 }
 
 impl Name {
-    pub fn suffix_reference_mut(&mut self) -> Option<&mut WithRef<Designator>> {
+    pub fn suffix_reference_mut(&mut self) -> Option<&mut Reference> {
         match self {
-            Name::Designator(suffix) => Some(suffix),
-            Name::Selected(_, suffix) => Some(&mut suffix.item),
+            Name::Designator(suffix) => Some(&mut suffix.reference),
+            Name::Selected(_, suffix) => Some(&mut suffix.item.reference),
+            _ => None,
+        }
+    }
+
+    // Get an already set suffix reference such as when an ambiguous overloaded call has already been resolved
+    pub fn get_suffix_reference(&self) -> Option<EntityId> {
+        match self {
+            Name::Designator(suffix) => suffix.reference,
+            Name::Selected(_, suffix) => suffix.item.reference,
             _ => None,
         }
     }
@@ -349,52 +359,212 @@ impl Name {
             Self::Attribute(attr) => attr.name.item.prefix(),
             Self::Designator(d) => Some(d.designator()),
             Self::External(..) => None,
-            Self::FunctionCall(fcall) => fcall.name.item.prefix(),
-            Self::Indexed(name, ..) => name.item.prefix(),
+            Self::CallOrIndexed(fcall) => fcall.name.item.prefix(),
             Self::SelectedAll(name) => name.item.prefix(),
             Self::Selected(name, ..) => name.item.prefix(),
             Self::Slice(name, ..) => name.item.prefix(),
         }
     }
+
+    /// Returns true if the name is purely a selected name
+    /// Example: a.b.c
+    pub fn is_selected_name(&self) -> bool {
+        match self {
+            Name::Designator(_) => true,
+            Name::Selected(prefix, _) => prefix.item.is_selected_name(),
+            _ => false,
+        }
+    }
 }
 
-impl FunctionCall {
+impl CallOrIndexed {
     // During parsing function calls and indexed names are ambiguous
     // Thus we convert function calls to indexed names during the analysis stage
-    #[allow(clippy::type_complexity)]
-    pub fn to_indexed(&self) -> Option<(Box<WithPos<Name>>, Vec<WithPos<Expression>>)> {
-        let FunctionCall {
-            ref name,
-            ref parameters,
-        } = self;
-
-        assoc_elems_to_indexes(parameters).map(|indexes| (Box::new(name.clone()), indexes))
-    }
-}
-
-fn assoc_elem_to_index(assoc_elem: &AssociationElement) -> Option<WithPos<Expression>> {
-    if assoc_elem.formal.is_some() {
-        return None;
-    }
-
-    match assoc_elem.actual.item {
-        ActualPart::Open => None,
-        ActualPart::Expression(ref expr) => {
-            Some(WithPos::new(expr.clone(), assoc_elem.actual.pos.clone()))
-        }
-    }
-}
-
-fn assoc_elems_to_indexes(assoc_elems: &[AssociationElement]) -> Option<Vec<WithPos<Expression>>> {
-    let mut result: Vec<WithPos<Expression>> = Vec::with_capacity(assoc_elems.len());
-
-    for elem in assoc_elems.iter() {
-        if let Some(expr) = assoc_elem_to_index(elem) {
-            result.push(expr);
-        } else {
+    pub fn as_indexed(&mut self) -> Option<IndexedName> {
+        if !self.could_be_indexed_name() {
             return None;
         }
+
+        let CallOrIndexed {
+            ref mut name,
+            ref mut parameters,
+        } = self;
+
+        let mut indexes: Vec<Index> = Vec::with_capacity(parameters.len());
+
+        for elem in parameters.iter_mut() {
+            if let ActualPart::Expression(ref mut expr) = &mut elem.actual.item {
+                indexes.push(Index {
+                    pos: &elem.actual.pos,
+                    expr,
+                });
+            }
+        }
+
+        Some(IndexedName { name, indexes })
     }
 
-    Some(result)
+    pub fn could_be_indexed_name(&self) -> bool {
+        self.parameters
+            .iter()
+            .all(|assoc| assoc.formal.is_none() && !matches!(assoc.actual.item, ActualPart::Open))
+    }
+}
+
+pub struct IndexedName<'a> {
+    pub name: &'a mut WithPos<Name>,
+    pub indexes: Vec<Index<'a>>,
+}
+
+pub struct Index<'a> {
+    pub pos: &'a SrcPos,
+    pub expr: &'a mut Expression,
+}
+
+impl AttributeName {
+    pub fn as_range(&self) -> Option<RangeAttribute> {
+        if let AttributeDesignator::Range(r) = self.attr.item {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_type(&self) -> Option<TypeAttribute> {
+        if self.signature.is_none() && self.expr.is_none() {
+            if let AttributeDesignator::Type(t) = self.attr.item {
+                Some(t)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl RangeConstraint {
+    pub fn pos(&self) -> SrcPos {
+        self.left_expr.pos.combine(&self.right_expr.pos)
+    }
+}
+
+impl crate::ast::Range {
+    pub fn pos(&self) -> SrcPos {
+        use crate::ast::Range::*;
+        match self {
+            Range(constraint) => constraint.pos(),
+            Attribute(attr) => attr.name.pos.combine(&attr.attr.pos),
+        }
+    }
+}
+
+impl DiscreteRange {
+    pub fn pos(&self) -> SrcPos {
+        match self {
+            DiscreteRange::Discrete(type_mark, _) => type_mark.pos.clone(),
+            DiscreteRange::Range(range) => range.pos(),
+        }
+    }
+}
+
+impl SubprogramDeclaration {
+    pub fn subpgm_designator(&self) -> &WithPos<SubprogramDesignator> {
+        match self {
+            SubprogramDeclaration::Procedure(s) => &s.designator.tree,
+            SubprogramDeclaration::Function(s) => &s.designator.tree,
+        }
+    }
+}
+
+impl SubprogramDeclaration {
+    pub fn reference_mut(&mut self) -> &mut Reference {
+        match self {
+            SubprogramDeclaration::Function(ref mut function) => &mut function.designator.decl,
+            SubprogramDeclaration::Procedure(ref mut procedure) => &mut procedure.designator.decl,
+        }
+    }
+}
+
+impl ConcurrentStatement {
+    pub fn label_typ(&self) -> Option<Concurrent> {
+        use ConcurrentStatement::*;
+        match self {
+            ProcedureCall(_) => None,
+            Block(_) => Some(Concurrent::Block),
+            Process(_) => Some(Concurrent::Process),
+            Assert(_) => None,
+            Assignment(_) => None,
+            Instance(_) => Some(Concurrent::Instance),
+            ForGenerate(_) | IfGenerate(_) | CaseGenerate(_) => Some(Concurrent::Generate),
+        }
+    }
+
+    pub fn end_label_pos(&self) -> Option<&SrcPos> {
+        use ConcurrentStatement::*;
+
+        match self {
+            ProcedureCall(_) => None,
+            Block(value) => value.end_label_pos.as_ref(),
+            Process(value) => value.end_label_pos.as_ref(),
+            Assert(_) => None,
+            Assignment(_) => None,
+            Instance(_) => None,
+            ForGenerate(value) => value.end_label_pos.as_ref(),
+            IfGenerate(value) => value.end_label_pos.as_ref(),
+            CaseGenerate(value) => value.end_label_pos.as_ref(),
+        }
+    }
+
+    pub fn can_have_label(&self) -> bool {
+        self.label_typ().is_some()
+    }
+}
+
+impl SequentialStatement {
+    pub fn label_typ(&self) -> Option<Sequential> {
+        use SequentialStatement::*;
+        match self {
+            Wait(_) => None,
+            Assert(_) => None,
+            Report(_) => None,
+            VariableAssignment(_) => None,
+            SignalAssignment(_) => None,
+            SignalForceAssignment(_) => None,
+            SignalReleaseAssignment(_) => None,
+            ProcedureCall(_) => None,
+            If(_) => Some(Sequential::If),
+            Case(_) => Some(Sequential::Case),
+            Loop(_) => Some(Sequential::Loop),
+            Next(_) => None,
+            Exit(_) => None,
+            Return(_) => None,
+            Null => None,
+        }
+    }
+
+    pub fn end_label_pos(&self) -> Option<&SrcPos> {
+        use SequentialStatement::*;
+        match self {
+            Wait(_) => None,
+            Assert(_) => None,
+            Report(_) => None,
+            VariableAssignment(_) => None,
+            SignalAssignment(_) => None,
+            SignalForceAssignment(_) => None,
+            SignalReleaseAssignment(_) => None,
+            ProcedureCall(_) => None,
+            If(value) => value.end_label_pos.as_ref(),
+            Case(value) => value.end_label_pos.as_ref(),
+            Loop(value) => value.end_label_pos.as_ref(),
+            Next(_) => None,
+            Exit(_) => None,
+            Return(_) => None,
+            Null => None,
+        }
+    }
+
+    pub fn can_have_label(&self) -> bool {
+        self.label_typ().is_some()
+    }
 }

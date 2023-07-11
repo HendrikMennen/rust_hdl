@@ -4,39 +4,35 @@
 //
 // Copyright (c) 2022, Olof Kraigher olof.kraigher@gmail.com
 
-use std::sync::Arc;
-
 use crate::{
-    ast::{Designator, InterfaceListType, Mode, ObjectClass},
+    ast::{Designator, InterfaceType, Mode, ObjectClass},
     Diagnostic, SrcPos,
 };
 
-use super::{
-    region::{NamedEntityKind, Object, TypeEnt},
-    NamedEntity,
-};
+use super::named_entity::*;
 
-#[derive(Clone)]
-pub struct InterfaceEnt {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceEnt<'a> {
     /// InterfaceObject or InterfaceFile
-    ent: Arc<NamedEntity>,
+    ent: EntRef<'a>,
 }
 
-impl InterfaceEnt {
-    pub fn inner(&self) -> &Arc<NamedEntity> {
-        &self.ent
+impl<'a> InterfaceEnt<'a> {
+    pub fn inner(&self) -> EntRef<'a> {
+        self.ent
     }
 
-    pub fn from_any(ent: Arc<NamedEntity>) -> Option<Self> {
+    pub fn from_any(ent: EntRef<'a>) -> Option<Self> {
         match ent.kind() {
-            NamedEntityKind::Object(Object { mode: Some(_), .. })
-            | NamedEntityKind::InterfaceFile(..) => Some(InterfaceEnt { ent }),
+            AnyEntKind::Object(Object { iface: Some(_), .. }) | AnyEntKind::InterfaceFile(..) => {
+                Some(InterfaceEnt { ent })
+            }
             _ => None,
         }
     }
 
     pub fn has_default(&self) -> bool {
-        if let NamedEntityKind::Object(Object { has_default, .. }) = self.ent.kind() {
+        if let AnyEntKind::Object(Object { has_default, .. }) = self.ent.kind() {
             *has_default
         } else {
             false
@@ -45,51 +41,56 @@ impl InterfaceEnt {
 
     pub fn is_signal(&self) -> bool {
         match self.ent.kind() {
-            NamedEntityKind::Object(obj) => obj.class == ObjectClass::Signal,
+            AnyEntKind::Object(obj) => obj.class == ObjectClass::Signal,
             _ => false,
         }
     }
 
-    pub fn is_output_signal(&self) -> bool {
+    pub fn is_out_or_inout_signal(&self) -> bool {
         match self.ent.kind() {
-            NamedEntityKind::Object(obj) => {
-                obj.class == ObjectClass::Signal && obj.mode == Some(Mode::Out)
+            AnyEntKind::Object(obj) => {
+                obj.class == ObjectClass::Signal
+                    && matches!(obj.mode(), Some(Mode::Out) | Some(Mode::InOut))
             }
             _ => false,
         }
     }
 
-    pub fn type_mark(&self) -> &TypeEnt {
+    pub fn type_mark(&self) -> TypeEnt<'a> {
         match self.ent.kind() {
-            NamedEntityKind::Object(obj) => obj.subtype.type_mark(),
-            NamedEntityKind::InterfaceFile(file_type) => file_type,
+            AnyEntKind::Object(obj) => obj.subtype.type_mark(),
+            AnyEntKind::InterfaceFile(file_type) => *file_type,
             _ => {
                 unreachable!();
             }
         }
     }
 
-    pub fn base_type(&self) -> &TypeEnt {
+    pub fn base_type(&self) -> TypeEnt<'a> {
         self.type_mark().base_type()
+    }
+
+    pub fn base(&self) -> BaseType<'a> {
+        self.type_mark().base()
     }
 }
 
-impl std::ops::Deref for InterfaceEnt {
-    type Target = NamedEntity;
-    fn deref(&self) -> &NamedEntity {
-        &self.ent
+impl<'a> std::ops::Deref for InterfaceEnt<'a> {
+    type Target = AnyEnt<'a>;
+    fn deref(&self) -> EntRef<'a> {
+        self.ent
     }
 }
 
 /// The formal region is an ordered list of interface elements such as ports, generics and subprogram arguments
 #[derive(Clone)]
-pub struct FormalRegion {
-    pub typ: InterfaceListType,
-    entities: Vec<InterfaceEnt>,
+pub struct FormalRegion<'a> {
+    pub(crate) typ: InterfaceType,
+    pub(crate) entities: Vec<InterfaceEnt<'a>>,
 }
 
-impl FormalRegion {
-    pub fn new(typ: InterfaceListType) -> Self {
+impl<'a> FormalRegion<'a> {
+    pub fn new(typ: InterfaceType) -> Self {
         Self {
             typ,
             entities: Default::default(),
@@ -98,27 +99,27 @@ impl FormalRegion {
 
     pub fn new_params() -> Self {
         Self {
-            typ: InterfaceListType::Parameter,
+            typ: InterfaceType::Parameter,
             entities: Default::default(),
         }
     }
 
-    pub fn new_with(typ: InterfaceListType, entities: Vec<InterfaceEnt>) -> Self {
+    pub fn new_with(typ: InterfaceType, entities: Vec<InterfaceEnt<'a>>) -> Self {
         Self { typ, entities }
     }
     pub fn lookup(
         &self,
         pos: &SrcPos,
         designator: &Designator,
-    ) -> Result<(usize, InterfaceEnt), Diagnostic> {
+    ) -> Result<(usize, InterfaceEnt<'a>), Diagnostic> {
         for (idx, ent) in self.entities.iter().enumerate() {
             if ent.designator() == designator {
-                return Ok((idx, ent.clone()));
+                return Ok((idx, *ent));
             }
         }
         Err(Diagnostic::error(
             pos,
-            format!("No declaration of '{}'", designator),
+            format!("No declaration of '{designator}'"),
         ))
     }
 
@@ -130,11 +131,11 @@ impl FormalRegion {
         self.entities.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &InterfaceEnt> {
-        self.entities.iter()
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = InterfaceEnt<'a>> + '_ {
+        self.entities.iter().cloned()
     }
 
-    pub fn add(&mut self, param: Arc<NamedEntity>) {
+    pub fn add(&mut self, param: EntRef<'a>) {
         if let Some(ent) = InterfaceEnt::from_any(param) {
             self.entities.push(ent);
         } else {
@@ -142,26 +143,31 @@ impl FormalRegion {
         }
     }
 
-    pub fn nth(&self, idx: usize) -> Option<&InterfaceEnt> {
-        self.entities.get(idx)
+    pub fn nth(&self, idx: usize) -> Option<InterfaceEnt<'a>> {
+        self.entities.get(idx).cloned()
     }
 
-    pub fn binary(&self) -> Option<(&InterfaceEnt, &InterfaceEnt)> {
-        let left = self.nth(0)?;
-        let right = self.nth(1)?;
-        Some((left, right))
+    pub fn unary(&self) -> Option<InterfaceEnt<'a>> {
+        if self.len() == 1 {
+            self.nth(0)
+        } else {
+            None
+        }
     }
 }
 
 /// The formal region is an ordered list of interface elements such as ports, generics and subprogram arguments
 #[derive(Default, Clone)]
-pub struct RecordRegion {
-    elems: Vec<RecordElement>,
+pub struct RecordRegion<'a> {
+    pub(crate) elems: Vec<RecordElement<'a>>,
 }
 
-impl RecordRegion {
-    pub fn lookup(&self, designator: &Designator) -> Option<&RecordElement> {
-        self.elems.iter().find(|ent| ent.designator() == designator)
+impl<'a> RecordRegion<'a> {
+    pub fn lookup(&self, designator: &Designator) -> Option<RecordElement<'a>> {
+        self.elems
+            .iter()
+            .find(|ent| ent.designator() == designator)
+            .cloned()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -172,11 +178,11 @@ impl RecordRegion {
         self.elems.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &RecordElement> {
-        self.elems.iter()
+    pub fn iter(&self) -> impl Iterator<Item = RecordElement<'a>> + '_ {
+        self.elems.iter().cloned()
     }
 
-    pub fn add(&mut self, ent: Arc<NamedEntity>) {
+    pub fn add(&mut self, ent: &'a AnyEnt) {
         if let Some(elem) = RecordElement::from_any(ent) {
             self.elems.push(elem);
         } else {
@@ -184,29 +190,29 @@ impl RecordRegion {
         }
     }
 
-    pub fn nth(&self, idx: usize) -> Option<&RecordElement> {
+    pub fn nth(&self, idx: usize) -> Option<&RecordElement<'a>> {
         self.elems.get(idx)
     }
 }
 
-#[derive(Clone)]
-pub struct RecordElement {
+#[derive(Clone, Copy)]
+pub struct RecordElement<'a> {
     // A record element declaration
-    ent: Arc<NamedEntity>,
+    ent: EntRef<'a>,
 }
 
-impl RecordElement {
-    pub fn from_any(ent: Arc<NamedEntity>) -> Option<Self> {
-        if let NamedEntityKind::ElementDeclaration(_) = ent.kind() {
+impl<'a> RecordElement<'a> {
+    pub fn from_any(ent: EntRef<'a>) -> Option<Self> {
+        if let AnyEntKind::ElementDeclaration(_) = ent.kind() {
             Some(RecordElement { ent })
         } else {
             None
         }
     }
 
-    pub fn type_mark(&self) -> &TypeEnt {
+    pub fn type_mark(&self) -> TypeEnt<'a> {
         match self.ent.kind() {
-            NamedEntityKind::ElementDeclaration(subtype) => subtype.type_mark(),
+            AnyEntKind::ElementDeclaration(subtype) => subtype.type_mark(),
             _ => {
                 unreachable!();
             }
@@ -214,21 +220,84 @@ impl RecordElement {
     }
 }
 
-impl std::ops::Deref for RecordElement {
-    type Target = NamedEntity;
-    fn deref(&self) -> &NamedEntity {
-        &self.ent
+impl<'a> std::ops::Deref for RecordElement<'a> {
+    type Target = AnyEnt<'a>;
+    fn deref(&self) -> EntRef<'a> {
+        self.ent
     }
 }
 
-impl AsRef<Arc<NamedEntity>> for RecordElement {
-    fn as_ref(&self) -> &Arc<NamedEntity> {
-        &self.ent
-    }
-}
-
-impl From<RecordElement> for Arc<NamedEntity> {
-    fn from(value: RecordElement) -> Self {
+impl<'a> From<RecordElement<'a>> for EntRef<'a> {
+    fn from(value: RecordElement<'a>) -> Self {
         value.ent
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GpkgInterfaceEnt<'a> {
+    Type(TypeEnt<'a>),
+    Constant(ObjectEnt<'a>),
+    Subprogram(OverloadedEnt<'a>),
+    Package(EntRef<'a>),
+}
+
+impl<'a> GpkgInterfaceEnt<'a> {
+    pub fn from_any(ent: EntRef<'a>) -> Option<Self> {
+        match ent.actual_kind() {
+            AnyEntKind::Type(Type::Interface) => {
+                Some(GpkgInterfaceEnt::Type(TypeEnt::from_any(ent).unwrap()))
+            }
+            AnyEntKind::Object(obj) if obj.is_generic() => Some(GpkgInterfaceEnt::Constant(
+                ObjectEnt::from_any(ent).unwrap(),
+            )),
+            AnyEntKind::Overloaded(Overloaded::InterfaceSubprogram(_)) => Some(
+                GpkgInterfaceEnt::Subprogram(OverloadedEnt::from_any(ent).unwrap()),
+            ),
+            AnyEntKind::Design(Design::PackageInstance(_)) => Some(GpkgInterfaceEnt::Package(ent)),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for GpkgInterfaceEnt<'a> {
+    type Target = AnyEnt<'a>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            GpkgInterfaceEnt::Type(typ) => typ.deref(),
+            GpkgInterfaceEnt::Constant(obj) => obj.deref(),
+            GpkgInterfaceEnt::Subprogram(subp) => subp.deref(),
+            GpkgInterfaceEnt::Package(ent) => ent.deref(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpkgRegion<'a> {
+    entities: Vec<GpkgInterfaceEnt<'a>>,
+}
+
+impl<'a> GpkgRegion<'a> {
+    pub fn new(entities: Vec<GpkgInterfaceEnt<'a>>) -> Self {
+        Self { entities }
+    }
+
+    pub fn lookup(
+        &self,
+        pos: &SrcPos,
+        designator: &Designator,
+    ) -> Result<(usize, GpkgInterfaceEnt<'a>), Diagnostic> {
+        for (idx, ent) in self.entities.iter().enumerate() {
+            if ent.designator() == designator {
+                return Ok((idx, *ent));
+            }
+        }
+        Err(Diagnostic::error(
+            pos,
+            format!("No declaration of '{designator}'"),
+        ))
+    }
+
+    pub fn nth(&self, idx: usize) -> Option<GpkgInterfaceEnt<'a>> {
+        self.entities.get(idx).cloned()
     }
 }

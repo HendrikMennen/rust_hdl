@@ -7,6 +7,7 @@
 // These fields are better explicit than .. since we are forced to consider if new fields should be searched
 #![allow(clippy::unneeded_field_pattern)]
 
+use super::named_entity::TypeEnt;
 use super::*;
 use crate::ast::*;
 use crate::data::*;
@@ -15,21 +16,124 @@ use region::*;
 use target::AssignmentType;
 
 impl<'a> AnalyzeContext<'a> {
-    fn analyze_sequential_statement(
+    pub fn define_labels_for_sequential_part(
         &self,
-        parent: &mut Region<'_>,
-        statement: &mut LabeledSequentialStatement,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
+        statements: &mut [LabeledSequentialStatement],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
-        if let Some(ref mut label) = statement.label {
-            parent.add(label.define(NamedEntityKind::Label), diagnostics);
+    ) -> FatalResult {
+        for statement in statements.iter_mut() {
+            let parent = if let Some(ref mut label) = statement.label.tree {
+                let ent = self.arena.explicit(
+                    label.name(),
+                    parent,
+                    AnyEntKind::Sequential(statement.statement.item.label_typ()),
+                    Some(label.pos()),
+                );
+                statement.label.decl = Some(ent.id());
+                scope.add(ent, diagnostics);
+                ent
+            } else if statement.statement.item.can_have_label() {
+                // Generate an anonymous label if it is not explicitly defined
+                let ent = self.arena.alloc(
+                    Designator::Anonymous(scope.next_anonymous()),
+                    Some(parent),
+                    Related::None,
+                    AnyEntKind::Sequential(statement.statement.item.label_typ()),
+                    None,
+                );
+                statement.label.decl = Some(ent.id());
+                ent
+            } else {
+                parent
+            };
+
+            match statement.statement.item {
+                SequentialStatement::If(ref mut ifstmt) => {
+                    let Conditionals {
+                        conditionals,
+                        else_item,
+                    } = &mut ifstmt.conds;
+
+                    for conditional in conditionals {
+                        self.define_labels_for_sequential_part(
+                            scope,
+                            parent,
+                            &mut conditional.item,
+                            diagnostics,
+                        )?;
+                    }
+                    if let Some(else_item) = else_item {
+                        self.define_labels_for_sequential_part(
+                            scope,
+                            parent,
+                            else_item,
+                            diagnostics,
+                        )?;
+                    }
+                }
+
+                SequentialStatement::Case(ref mut case_stmt) => {
+                    for alternative in case_stmt.alternatives.iter_mut() {
+                        self.define_labels_for_sequential_part(
+                            scope,
+                            parent,
+                            &mut alternative.item,
+                            diagnostics,
+                        )?;
+                    }
+                }
+                SequentialStatement::Loop(ref mut loop_stmt) => {
+                    self.define_labels_for_sequential_part(
+                        scope,
+                        parent,
+                        &mut loop_stmt.statements,
+                        diagnostics,
+                    )?;
+                }
+                _ => {
+                    // Does not have sequential part
+                }
+            }
         }
 
-        match statement.statement {
+        Ok(())
+    }
+
+    fn analyze_sequential_statement(
+        &self,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
+        statement: &mut LabeledSequentialStatement,
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) -> FatalResult {
+        match statement.statement.item {
             SequentialStatement::Return(ref mut ret) => {
-                let ReturnStatement { expression } = ret;
-                if let Some(ref mut expression) = expression {
-                    self.analyze_expression(parent, expression, diagnostics)?;
+                let ReturnStatement { ref mut expression } = ret;
+
+                match SequentialRoot::from(parent) {
+                    SequentialRoot::Function(ttyp) => {
+                        if let Some(ref mut expression) = expression {
+                            self.expr_with_ttyp(scope, ttyp, expression, diagnostics)?;
+                        } else {
+                            diagnostics.error(
+                                &statement.statement.pos,
+                                "Functions cannot return without a value",
+                            );
+                        }
+                    }
+                    SequentialRoot::Procedure => {
+                        if expression.is_some() {
+                            diagnostics.error(
+                                &statement.statement.pos,
+                                "Procedures cannot return a value",
+                            );
+                        }
+                    }
+                    SequentialRoot::Process => {
+                        diagnostics.error(&statement.statement.pos, "Cannot return from a process");
+                    }
                 }
             }
             SequentialStatement::Wait(ref mut wait_stmt) => {
@@ -38,14 +142,12 @@ impl<'a> AnalyzeContext<'a> {
                     condition_clause,
                     timeout_clause,
                 } = wait_stmt;
-                for name in sensitivity_clause.iter_mut() {
-                    self.resolve_name(parent, &name.pos, &mut name.item, diagnostics)?;
-                }
+                self.sensitivity_list_check(scope, sensitivity_clause, diagnostics)?;
                 if let Some(expr) = condition_clause {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.boolean_expr(scope, expr, diagnostics)?;
                 }
                 if let Some(expr) = timeout_clause {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.time(), expr, diagnostics)?;
                 }
             }
             SequentialStatement::Assert(ref mut assert_stmt) => {
@@ -54,57 +156,73 @@ impl<'a> AnalyzeContext<'a> {
                     report,
                     severity,
                 } = assert_stmt;
-                self.analyze_expression(parent, condition, diagnostics)?;
+                self.boolean_expr(scope, condition, diagnostics)?;
                 if let Some(expr) = report {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.string(), expr, diagnostics)?;
                 }
                 if let Some(expr) = severity {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.severity_level(), expr, diagnostics)?;
                 }
             }
             SequentialStatement::Report(ref mut report_stmt) => {
                 let ReportStatement { report, severity } = report_stmt;
-                self.analyze_expression(parent, report, diagnostics)?;
+                self.expr_with_ttyp(scope, self.string(), report, diagnostics)?;
                 if let Some(expr) = severity {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.expr_with_ttyp(scope, self.severity_level(), expr, diagnostics)?;
                 }
             }
             SequentialStatement::Exit(ref mut exit_stmt) => {
                 let ExitStatement {
                     condition,
-                    // @TODO loop label
-                    ..
+                    loop_label,
                 } = exit_stmt;
 
+                if let Some(loop_label) = loop_label {
+                    self.check_loop_label(scope, parent, loop_label, diagnostics);
+                } else if !find_outer_loop(parent, None) {
+                    diagnostics.error(
+                        &statement.statement.pos,
+                        "Exit can only be used inside a loop",
+                    )
+                }
+
                 if let Some(expr) = condition {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.boolean_expr(scope, expr, diagnostics)?;
                 }
             }
             SequentialStatement::Next(ref mut next_stmt) => {
                 let NextStatement {
                     condition,
-                    // @TODO loop label
-                    ..
+                    loop_label,
                 } = next_stmt;
 
+                if let Some(loop_label) = loop_label {
+                    self.check_loop_label(scope, parent, loop_label, diagnostics);
+                } else if !find_outer_loop(parent, None) {
+                    diagnostics.error(
+                        &statement.statement.pos,
+                        "Next can only be used inside a loop",
+                    )
+                }
+
                 if let Some(expr) = condition {
-                    self.analyze_expression(parent, expr, diagnostics)?;
+                    self.boolean_expr(scope, expr, diagnostics)?;
                 }
             }
             SequentialStatement::If(ref mut ifstmt) => {
-                let IfStatement {
+                let Conditionals {
                     conditionals,
                     else_item,
-                } = ifstmt;
+                } = &mut ifstmt.conds;
 
                 // @TODO write generic function for this
                 for conditional in conditionals {
                     let Conditional { condition, item } = conditional;
-                    self.analyze_sequential_part(parent, item, diagnostics)?;
-                    self.analyze_expression(parent, condition, diagnostics)?;
+                    self.boolean_expr(scope, condition, diagnostics)?;
+                    self.analyze_sequential_part(scope, parent, item, diagnostics)?;
                 }
                 if let Some(else_item) = else_item {
-                    self.analyze_sequential_part(parent, else_item, diagnostics)?;
+                    self.analyze_sequential_part(scope, parent, else_item, diagnostics)?;
                 }
             }
             SequentialStatement::Case(ref mut case_stmt) => {
@@ -112,43 +230,49 @@ impl<'a> AnalyzeContext<'a> {
                     is_matching: _,
                     expression,
                     alternatives,
+                    end_label_pos: _,
                 } = case_stmt;
-                self.analyze_expression(parent, expression, diagnostics)?;
+                let ctyp = as_fatal(self.expr_unambiguous_type(scope, expression, diagnostics))?;
                 for alternative in alternatives.iter_mut() {
                     let Alternative { choices, item } = alternative;
-                    self.analyze_choices(parent, choices, diagnostics)?;
-                    self.analyze_sequential_part(parent, item, diagnostics)?;
+                    self.choice_with_ttyp(scope, ctyp, choices, diagnostics)?;
+                    self.analyze_sequential_part(scope, parent, item, diagnostics)?;
                 }
             }
             SequentialStatement::Loop(ref mut loop_stmt) => {
                 let LoopStatement {
                     iteration_scheme,
                     statements,
+                    end_label_pos: _,
                 } = loop_stmt;
                 match iteration_scheme {
                     Some(IterationScheme::For(ref mut index, ref mut drange)) => {
-                        self.analyze_discrete_range(parent, drange, diagnostics)?;
-                        let mut region = parent.nested();
-                        region.add(index.define(NamedEntityKind::LoopParameter), diagnostics);
-                        self.analyze_sequential_part(&mut region, statements, diagnostics)?;
+                        let typ = as_fatal(self.drange_type(scope, drange, diagnostics))?;
+                        let region = scope.nested();
+                        region.add(
+                            self.arena
+                                .define(index, parent, AnyEntKind::LoopParameter(typ)),
+                            diagnostics,
+                        );
+                        self.analyze_sequential_part(&region, parent, statements, diagnostics)?;
                     }
                     Some(IterationScheme::While(ref mut expr)) => {
-                        self.analyze_expression(parent, expr, diagnostics)?;
-                        self.analyze_sequential_part(parent, statements, diagnostics)?;
+                        self.boolean_expr(scope, expr, diagnostics)?;
+                        self.analyze_sequential_part(scope, parent, statements, diagnostics)?;
                     }
                     None => {
-                        self.analyze_sequential_part(parent, statements, diagnostics)?;
+                        self.analyze_sequential_part(scope, parent, statements, diagnostics)?;
                     }
                 }
             }
             SequentialStatement::ProcedureCall(ref mut pcall) => {
-                self.analyze_procedure_call(parent, pcall, diagnostics)?;
+                self.analyze_procedure_call(scope, pcall, diagnostics)?;
             }
             SequentialStatement::SignalAssignment(ref mut assign) => {
                 // @TODO more
                 let SignalAssignment { target, rhs, .. } = assign;
                 self.analyze_waveform_assignment(
-                    parent,
+                    scope,
                     target,
                     AssignmentType::Signal,
                     rhs,
@@ -158,7 +282,7 @@ impl<'a> AnalyzeContext<'a> {
             SequentialStatement::VariableAssignment(ref mut assign) => {
                 let VariableAssignment { target, rhs } = assign;
                 self.analyze_expr_assignment(
-                    parent,
+                    scope,
                     target,
                     AssignmentType::Variable,
                     rhs,
@@ -172,7 +296,7 @@ impl<'a> AnalyzeContext<'a> {
                     rhs,
                 } = assign;
                 self.analyze_expr_assignment(
-                    parent,
+                    scope,
                     target,
                     AssignmentType::Signal,
                     rhs,
@@ -184,23 +308,124 @@ impl<'a> AnalyzeContext<'a> {
                     target,
                     force_mode: _,
                 } = assign;
-                self.analyze_target(parent, target, AssignmentType::Signal, diagnostics)?;
+                as_fatal(self.resolve_target(scope, target, AssignmentType::Signal, diagnostics))?;
             }
             SequentialStatement::Null => {}
         }
         Ok(())
     }
 
+    fn check_loop_label(
+        &self,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
+        label: &mut WithRef<Ident>,
+        diagnostics: &mut dyn DiagnosticHandler,
+    ) {
+        match scope.lookup(
+            &label.item.pos,
+            &Designator::Identifier(label.item.item.clone()),
+        ) {
+            Ok(NamedEntities::Single(ent)) => {
+                label.set_unique_reference(ent);
+                if matches!(ent.kind(), AnyEntKind::Sequential(Some(Sequential::Loop))) {
+                    if !find_outer_loop(parent, Some(label.item.name())) {
+                        diagnostics.error(
+                            &label.item.pos,
+                            format!("Cannot be used outside of loop '{}'", ent.designator()),
+                        );
+                    }
+                } else {
+                    diagnostics.error(
+                        &label.item.pos,
+                        format!("Expected loop label, got {}", ent.describe()),
+                    );
+                }
+            }
+            Ok(NamedEntities::Overloaded(_)) => diagnostics.error(
+                &label.item.pos,
+                format!(
+                    "Expected loop label, got overloaded name {}",
+                    &label.item.item
+                ),
+            ),
+            Err(diag) => {
+                diagnostics.push(diag);
+            }
+        }
+    }
+
     pub fn analyze_sequential_part(
         &self,
-        parent: &mut Region<'_>,
+        scope: &Scope<'a>,
+        parent: EntRef<'a>,
         statements: &mut [LabeledSequentialStatement],
         diagnostics: &mut dyn DiagnosticHandler,
-    ) -> FatalNullResult {
+    ) -> FatalResult {
         for statement in statements.iter_mut() {
-            self.analyze_sequential_statement(parent, statement, diagnostics)?;
+            let parent = if let Some(id) = statement.label.decl {
+                self.arena.get(id)
+            } else {
+                parent
+            };
+
+            self.analyze_sequential_statement(scope, parent, statement, diagnostics)?;
         }
 
         Ok(())
+    }
+}
+
+enum SequentialRoot<'a> {
+    Process,
+    Procedure,
+    Function(TypeEnt<'a>),
+}
+
+fn find_outer_loop(ent: EntRef, label: Option<&Symbol>) -> bool {
+    match ent.kind() {
+        AnyEntKind::Sequential(Some(Sequential::Loop)) => {
+            if let Some(label) = label {
+                if matches!(ent.designator(), Designator::Identifier(ident) if ident == label) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        AnyEntKind::Sequential(_) => {}
+        _ => {
+            return false;
+        }
+    }
+
+    if let Some(parent) = ent.parent {
+        find_outer_loop(parent, label)
+    } else {
+        false
+    }
+}
+
+impl<'a> From<EntRef<'a>> for SequentialRoot<'a> {
+    fn from(value: EntRef<'a>) -> Self {
+        match value.kind() {
+            AnyEntKind::Overloaded(overloaded) => {
+                if let Some(return_type) = overloaded.signature().return_type() {
+                    SequentialRoot::Function(return_type)
+                } else {
+                    SequentialRoot::Procedure
+                }
+            }
+            AnyEntKind::Sequential(_) => {
+                if let Some(parent) = value.parent {
+                    SequentialRoot::from(parent)
+                } else {
+                    // A sequential statement must always have a parent this should never happen
+                    SequentialRoot::Process
+                }
+            }
+            AnyEntKind::Concurrent(Some(Concurrent::Process)) => SequentialRoot::Process,
+            _ => SequentialRoot::Process,
+        }
     }
 }

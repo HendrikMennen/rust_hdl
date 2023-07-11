@@ -18,15 +18,15 @@ use super::type_declaration::parse_type_declaration;
 use crate::ast::{ContextClause, Declaration, PackageInstantiation};
 use crate::data::DiagnosticHandler;
 
-pub fn parse_package_instantiation(stream: &mut TokenStream) -> ParseResult<PackageInstantiation> {
+pub fn parse_package_instantiation(stream: &TokenStream) -> ParseResult<PackageInstantiation> {
     stream.expect_kind(Package)?;
     let ident = stream.expect_ident()?;
     stream.expect_kind(Is)?;
     stream.expect_kind(New)?;
     let package_name = parse_selected_name(stream)?;
 
-    let token = stream.expect()?;
-    let generic_map = try_token_kind!(
+    let generic_map = expect_token!(
+        stream,
         token,
         Generic => {
             stream.expect_kind(Map)?;
@@ -43,8 +43,8 @@ pub fn parse_package_instantiation(stream: &mut TokenStream) -> ParseResult<Pack
     })
 }
 
-pub fn is_declarative_part(stream: &mut TokenStream, begin_is_end: bool) -> ParseResult<bool> {
-    Ok(check_declarative_part(&stream.peek_expect()?, !begin_is_end, begin_is_end).is_ok())
+pub fn is_declarative_part(stream: &TokenStream, begin_is_end: bool) -> ParseResult<bool> {
+    Ok(check_declarative_part(stream.peek_expect()?, !begin_is_end, begin_is_end).is_ok())
 }
 
 fn check_declarative_part(token: &Token, may_end: bool, may_begin: bool) -> ParseResult<()> {
@@ -63,20 +63,9 @@ fn check_declarative_part(token: &Token, may_end: bool, may_begin: bool) -> Pars
         }
     }
 }
+
 pub fn parse_declarative_part(
-    stream: &mut TokenStream,
-    diagnostics: &mut dyn DiagnosticHandler,
-    begin_is_end: bool,
-) -> ParseResult<Vec<Declaration>> {
-    let end_token = if begin_is_end { Begin } else { End };
-    let decl = parse_declarative_part_leave_end_token(stream, diagnostics)?;
-
-    stream.expect_kind(end_token).log(diagnostics);
-    Ok(decl)
-}
-
-pub fn parse_declarative_part_leave_end_token(
-    stream: &mut TokenStream,
+    stream: &TokenStream,
     diagnostics: &mut dyn DiagnosticHandler,
 ) -> ParseResult<Vec<Declaration>> {
     let mut declarations: Vec<Declaration> = Vec::new();
@@ -100,10 +89,12 @@ pub fn parse_declarative_part_leave_end_token(
                 | Attribute
                 | Use
                 | Alias
+                | Begin
+                | End
         )
     }
 
-    while let Some(token) = stream.peek()? {
+    while let Some(token) = stream.peek() {
         match token.kind {
             Begin | End => break,
             Type | Subtype | Component | Impure | Pure | Function | Procedure | Package | For => {
@@ -230,8 +221,7 @@ var invalid: broken;
 constant x: natural := 5;
 ",
         );
-        let (decls, msgs) =
-            code.with_partial_stream_diagnostics(parse_declarative_part_leave_end_token);
+        let (decls, msgs) = code.with_partial_stream_diagnostics(parse_declarative_part);
         assert_eq!(
             decls,
             Ok(vec![Declaration::Object(ObjectDeclaration {
@@ -258,8 +248,7 @@ constant x: natural := 5;
     fn parse_declarative_part_error() {
         // Just checking that there is not an infinite loop
         let code = Code::new("invalid");
-        let (decl, _) =
-            code.with_partial_stream_diagnostics(parse_declarative_part_leave_end_token);
+        let (decl, _) = code.with_partial_stream_diagnostics(parse_declarative_part);
         assert!(decl.is_err());
     }
 }

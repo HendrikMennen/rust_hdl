@@ -19,9 +19,13 @@ mod syntax;
 
 pub use crate::config::Config;
 pub use crate::data::{
-    Diagnostic, Latin1String, Message, MessageHandler, MessagePrinter, MessageType, Position,
-    Range, Severity, Source, SrcPos,
+    Diagnostic, Latin1String, Message, MessageHandler, MessagePrinter, MessageType,
+    NullDiagnostics, NullMessages, Position, Range, Severity, Source, SrcPos,
 };
 
+pub use crate::analysis::{
+    AnyEnt, AnyEntKind, Concurrent, Design, EntHierarchy, EntRef, EntityId, Object, Overloaded,
+    Type,
+};
 pub use crate::project::{Project, SourceFile};
 pub use crate::syntax::{ParserResult, VHDLParser};

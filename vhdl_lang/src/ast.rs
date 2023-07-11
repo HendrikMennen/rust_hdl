@@ -9,7 +9,6 @@
 // Track here: https://github.com/rust-lang/rust/issues/29641
 #![allow(clippy::large_enum_variant)]
 
-use std::sync::Arc;
 mod display;
 mod util;
 
@@ -20,10 +19,10 @@ mod any_design_unit;
 pub mod search;
 
 pub use self::display::*;
-pub use self::util::*;
-pub use any_design_unit::*;
+pub(crate) use self::util::*;
+pub(crate) use any_design_unit::*;
 
-pub use crate::analysis::NamedEntity;
+use crate::analysis::EntityId;
 use crate::data::*;
 
 /// LRM 15.8 Bit string literals
@@ -90,8 +89,61 @@ pub enum Operator {
 pub struct AttributeName {
     pub name: WithPos<Name>,
     pub signature: Option<WithPos<Signature>>,
-    pub attr: Ident,
+    pub attr: WithPos<AttributeDesignator>,
     pub expr: Option<Box<WithPos<Expression>>>,
+}
+
+#[derive(PartialEq, Debug, Copy, Clone, Eq)]
+pub enum TypeAttribute {
+    Subtype,
+    Element,
+}
+
+#[derive(PartialEq, Debug, Copy, Clone, Eq)]
+pub enum RangeAttribute {
+    Range,
+    ReverseRange,
+}
+
+#[derive(PartialEq, Debug, Clone, Eq)]
+pub enum AttributeDesignator {
+    Type(TypeAttribute),
+    Range(RangeAttribute),
+    Ident(Symbol),
+    Ascending,
+    Descending,
+    Left,
+    Right,
+    High,
+    Low,
+    Length,
+    Image,
+    Value,
+    Pos,
+    Val,
+    Succ,
+    Pred,
+    LeftOf,
+    RightOf,
+    Signal(SignalAttribute),
+    SimpleName,
+    InstanceName,
+    PathName,
+}
+
+#[derive(PartialEq, Debug, Copy, Clone, Eq)]
+pub enum SignalAttribute {
+    Delayed,
+    Stable,
+    Quiet,
+    Transaction,
+    Event,
+    Active,
+    LastEvent,
+    LastActive,
+    LastValue,
+    Driving,
+    DrivingValue,
 }
 
 /// LRM 8.7 External names
@@ -136,10 +188,9 @@ pub enum Name {
     Designator(WithRef<Designator>),
     Selected(Box<WithPos<Name>>, WithPos<WithRef<Designator>>),
     SelectedAll(Box<WithPos<Name>>),
-    Indexed(Box<WithPos<Name>>, Vec<WithPos<Expression>>),
     Slice(Box<WithPos<Name>>, Box<DiscreteRange>),
     Attribute(Box<AttributeName>),
-    FunctionCall(Box<FunctionCall>),
+    CallOrIndexed(Box<CallOrIndexed>),
     External(Box<ExternalName>),
 }
 
@@ -153,7 +204,7 @@ pub enum SelectedName {
 
 /// LRM 9.3.4 Function calls
 #[derive(PartialEq, Debug, Clone)]
-pub struct FunctionCall {
+pub struct CallOrIndexed {
     pub name: WithPos<Name>,
     pub parameters: Vec<AssociationElement>,
 }
@@ -161,7 +212,7 @@ pub struct FunctionCall {
 /// LRM 9.3.3 Aggregates
 #[derive(PartialEq, Debug, Clone)]
 pub enum Choice {
-    Expression(WithPos<Expression>),
+    Expression(Expression),
     DiscreteRange(DiscreteRange),
     Others,
 }
@@ -170,7 +221,7 @@ pub enum Choice {
 #[derive(PartialEq, Debug, Clone)]
 pub enum ElementAssociation {
     Positional(WithPos<Expression>),
-    Named(Vec<Choice>, WithPos<Expression>),
+    Named(Vec<WithPos<Choice>>, WithPos<Expression>),
 }
 
 /// LRM 6.5.7 Association Lists
@@ -276,7 +327,7 @@ pub enum Direction {
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum DiscreteRange {
-    Discrete(WithPos<SelectedName>, Option<Range>),
+    Discrete(WithPos<TypeMark>, Option<Range>),
     Range(Range),
 }
 
@@ -327,8 +378,7 @@ pub enum ResolutionIndication {
 #[derive(PartialEq, Debug, Clone)]
 pub struct TypeMark {
     pub name: WithPos<SelectedName>,
-    // Is the 'subtype attribute of the selected name
-    pub subtype: bool,
+    pub attr: Option<TypeAttribute>,
 }
 
 /// LRM 6.3 Subtype declarations
@@ -344,7 +394,7 @@ pub struct SubtypeIndication {
 pub enum ArrayIndex {
     /// Unbounded
     /// {identifier} range <>
-    IndexSubtypeDefintion(WithPos<SelectedName>),
+    IndexSubtypeDefintion(WithPos<TypeMark>),
 
     /// Constraint
     Discrete(DiscreteRange),
@@ -368,9 +418,10 @@ pub enum Designator {
     Identifier(Symbol),
     OperatorSymbol(Operator),
     Character(u8),
+    Anonymous(usize),
 }
 
-pub type Reference = Option<Arc<NamedEntity>>;
+pub type Reference = Option<EntityId>;
 
 /// An item which has a reference to a declaration
 #[derive(PartialEq, Debug, Clone)]
@@ -392,7 +443,7 @@ impl<T> WithRef<T> {
 #[derive(PartialEq, Debug, Clone)]
 pub struct WithDecl<T> {
     pub tree: T,
-    pub decl: Option<Arc<NamedEntity>>,
+    pub decl: Option<EntityId>,
 }
 
 impl<T> WithDecl<T> {
@@ -432,7 +483,7 @@ pub struct AttributeDeclaration {
 /// LRM 7.2 Attribute specification
 #[derive(PartialEq, Debug, Clone)]
 pub struct EntityTag {
-    pub designator: WithPos<Designator>,
+    pub designator: WithPos<WithRef<Designator>>,
     pub signature: Option<WithPos<Signature>>,
 }
 
@@ -465,7 +516,7 @@ pub enum EntityClass {
 /// LRM 7.2 Attribute specification
 #[derive(PartialEq, Debug, Clone)]
 pub struct AttributeSpecification {
-    pub ident: WithDecl<Ident>,
+    pub ident: WithRef<Ident>,
     pub entity_name: EntityName,
     pub entity_class: EntityClass,
     pub expr: WithPos<Expression>,
@@ -487,7 +538,6 @@ pub struct ProtectedTypeDeclaration {
 /// LRM 5.6.3 Protected type bodies
 #[derive(PartialEq, Debug, Clone)]
 pub struct ProtectedTypeBody {
-    pub type_reference: Reference,
     pub decl: Vec<Declaration>,
 }
 
@@ -513,7 +563,8 @@ pub enum TypeDefinition {
     /// LRM 5.2.2 Enumeration types
     Enumeration(Vec<WithDecl<WithPos<EnumerationLiteral>>>),
     /// LRM 5.2.3 Integer types
-    Integer(Range),
+    ///     5.2.5 Floating-point types
+    Numeric(Range),
     /// LRM 5.2.4 Physical types
     Physical(PhysicalTypeDeclaration),
     // @TODO floating
@@ -527,7 +578,7 @@ pub enum TypeDefinition {
     /// LRM 5.4.2 Incomplete type declarations
     Incomplete(Reference),
     /// LRM 5.5 File types
-    File(WithPos<SelectedName>),
+    File(WithPos<TypeMark>),
     /// LRM 5.6 Protected types
     Protected(ProtectedTypeDeclaration),
     ProtectedBody(ProtectedTypeBody),
@@ -540,6 +591,7 @@ pub enum TypeDefinition {
 pub struct TypeDeclaration {
     pub ident: WithDecl<Ident>,
     pub def: TypeDefinition,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 6.4.2 Object Declarations
@@ -552,7 +604,7 @@ pub enum ObjectClass {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum InterfaceListType {
+pub enum InterfaceType {
     Port,
     Generic,
     Parameter,
@@ -593,7 +645,7 @@ pub struct FunctionSpecification {
     pub pure: bool,
     pub designator: WithDecl<WithPos<SubprogramDesignator>>,
     pub parameter_list: Vec<InterfaceDeclaration>,
-    pub return_type: WithPos<SelectedName>,
+    pub return_type: WithPos<TypeMark>,
 }
 
 /// LRM 4.3 Subprogram bodies
@@ -602,13 +654,14 @@ pub struct SubprogramBody {
     pub specification: SubprogramDeclaration,
     pub declarations: Vec<Declaration>,
     pub statements: Vec<LabeledSequentialStatement>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 4.5.3 Signatures
 #[derive(PartialEq, Debug, Clone)]
 pub enum Signature {
-    Function(Vec<WithPos<SelectedName>>, WithPos<SelectedName>),
-    Procedure(Vec<WithPos<SelectedName>>),
+    Function(Vec<WithPos<TypeMark>>, WithPos<TypeMark>),
+    Procedure(Vec<WithPos<TypeMark>>),
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -626,7 +679,7 @@ pub struct InterfaceFileDeclaration {
 /// LRM 6.5.2 Interface object declarations
 #[derive(PartialEq, Debug, Clone)]
 pub struct InterfaceObjectDeclaration {
-    pub list_type: InterfaceListType,
+    pub list_type: InterfaceType,
     pub class: ObjectClass,
     pub ident: WithDecl<Ident>,
     pub mode: Mode,
@@ -686,6 +739,7 @@ pub struct ComponentDeclaration {
     pub ident: WithDecl<Ident>,
     pub generic_list: Vec<InterfaceDeclaration>,
     pub port_list: Vec<InterfaceDeclaration>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -809,15 +863,16 @@ pub struct Conditionals<T> {
     pub else_item: Option<T>,
 }
 
-pub type ConditionalExpression = Conditional<WithPos<Expression>>;
-pub type ConditionalExpressions = Conditionals<WithPos<Expression>>;
-
 /// LRM 10.8 If statement
-pub type IfStatement = Conditionals<Vec<LabeledSequentialStatement>>;
+#[derive(PartialEq, Debug, Clone)]
+pub struct IfStatement {
+    pub conds: Conditionals<Vec<LabeledSequentialStatement>>,
+    pub end_label_pos: Option<SrcPos>,
+}
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct Alternative<T> {
-    pub choices: Vec<Choice>,
+    pub choices: Vec<WithPos<Choice>>,
     pub item: T,
 }
 
@@ -833,6 +888,7 @@ pub struct CaseStatement {
     pub is_matching: bool,
     pub expression: WithPos<Expression>,
     pub alternatives: Vec<Alternative<Vec<LabeledSequentialStatement>>>,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// LRM 10.10 Loop statement
@@ -847,19 +903,20 @@ pub enum IterationScheme {
 pub struct LoopStatement {
     pub iteration_scheme: Option<IterationScheme>,
     pub statements: Vec<LabeledSequentialStatement>,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// LRM 10.11 Next statement
 #[derive(PartialEq, Debug, Clone)]
 pub struct NextStatement {
-    pub loop_label: Option<Ident>,
+    pub loop_label: Option<WithRef<Ident>>,
     pub condition: Option<WithPos<Expression>>,
 }
 
 /// LRM 10.12 Exit statement
 #[derive(PartialEq, Debug, Clone)]
 pub struct ExitStatement {
-    pub loop_label: Option<Ident>,
+    pub loop_label: Option<WithRef<Ident>>,
     pub condition: Option<WithPos<Expression>>,
 }
 
@@ -879,7 +936,7 @@ pub enum SequentialStatement {
     SignalAssignment(SignalAssignment),
     SignalForceAssignment(SignalForceAssignment),
     SignalReleaseAssignment(SignalReleaseAssignment),
-    ProcedureCall(FunctionCall),
+    ProcedureCall(WithPos<CallOrIndexed>),
     If(IfStatement),
     Case(CaseStatement),
     Loop(LoopStatement),
@@ -892,8 +949,8 @@ pub enum SequentialStatement {
 /// LRM 10. Sequential statements
 #[derive(PartialEq, Debug, Clone)]
 pub struct LabeledSequentialStatement {
-    pub label: Option<WithDecl<Ident>>,
-    pub statement: SequentialStatement,
+    pub label: WithDecl<Option<Ident>>,
+    pub statement: WithPos<SequentialStatement>,
 }
 
 /// LRM 11.2 Block statement
@@ -903,6 +960,7 @@ pub struct BlockStatement {
     pub header: BlockHeader,
     pub decl: Vec<Declaration>,
     pub statements: Vec<LabeledConcurrentStatement>,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// LRM 11.2 Block statement
@@ -927,13 +985,14 @@ pub struct ProcessStatement {
     pub sensitivity_list: Option<SensitivityList>,
     pub decl: Vec<Declaration>,
     pub statements: Vec<LabeledSequentialStatement>,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// LRM 11.4 Concurrent procedure call statements
 #[derive(PartialEq, Debug, Clone)]
 pub struct ConcurrentProcedureCall {
     pub postponed: bool,
-    pub call: FunctionCall,
+    pub call: WithPos<CallOrIndexed>,
 }
 
 /// LRM 11.5 Concurrent assertion statements
@@ -957,7 +1016,7 @@ pub struct ConcurrentSignalAssignment {
 #[derive(PartialEq, Debug, Clone)]
 pub enum InstantiatedUnit {
     Component(WithPos<SelectedName>),
-    Entity(WithPos<SelectedName>, Option<Ident>),
+    Entity(WithPos<SelectedName>, Option<WithRef<Ident>>),
     Configuration(WithPos<SelectedName>),
 }
 
@@ -975,6 +1034,7 @@ pub struct GenerateBody {
     pub alternative_label: Option<WithDecl<Ident>>,
     pub decl: Option<Vec<Declaration>>,
     pub statements: Vec<LabeledConcurrentStatement>,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// 11.8 Generate statements
@@ -983,11 +1043,20 @@ pub struct ForGenerateStatement {
     pub index_name: WithDecl<Ident>,
     pub discrete_range: DiscreteRange,
     pub body: GenerateBody,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// 11.8 Generate statements
-pub type IfGenerateStatement = Conditionals<GenerateBody>;
-pub type CaseGenerateStatement = Selection<GenerateBody>;
+#[derive(PartialEq, Debug, Clone)]
+pub struct IfGenerateStatement {
+    pub conds: Conditionals<GenerateBody>,
+    pub end_label_pos: Option<SrcPos>,
+}
+#[derive(PartialEq, Debug, Clone)]
+pub struct CaseGenerateStatement {
+    pub sels: Selection<GenerateBody>,
+    pub end_label_pos: Option<SrcPos>,
+}
 
 /// LRM 11. Concurrent statements
 #[derive(PartialEq, Debug, Clone)]
@@ -1006,14 +1075,14 @@ pub enum ConcurrentStatement {
 /// LRM 11. Concurrent statements
 #[derive(PartialEq, Debug, Clone)]
 pub struct LabeledConcurrentStatement {
-    pub label: Option<WithDecl<Ident>>,
-    pub statement: ConcurrentStatement,
+    pub label: WithDecl<Option<Ident>>,
+    pub statement: WithPos<ConcurrentStatement>,
 }
 
 /// LRM 13. Design units and their analysis
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub struct LibraryClause {
-    pub name_list: Vec<Ident>,
+    pub name_list: Vec<WithRef<Ident>>,
 }
 
 /// LRM 12.4. Use clauses
@@ -1041,6 +1110,7 @@ pub enum ContextItem {
 pub struct ContextDeclaration {
     pub ident: WithDecl<Ident>,
     pub items: ContextClause,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 4.9 Package instatiation declaration
@@ -1137,6 +1207,7 @@ pub struct ConfigurationDeclaration {
     pub decl: Vec<ConfigurationDeclarativeItem>,
     pub vunit_bind_inds: Vec<VUnitBindingIndication>,
     pub block_config: BlockConfiguration,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 3.2 Entity declarations
@@ -1148,16 +1219,18 @@ pub struct EntityDeclaration {
     pub port_clause: Option<Vec<InterfaceDeclaration>>,
     pub decl: Vec<Declaration>,
     pub statements: Vec<LabeledConcurrentStatement>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 3.3 Architecture bodies
 #[derive(PartialEq, Debug, Clone)]
 pub struct ArchitectureBody {
     pub context_clause: ContextClause,
-    pub ident: Ident,
+    pub ident: WithDecl<Ident>,
     pub entity_name: WithRef<Ident>,
     pub decl: Vec<Declaration>,
     pub statements: Vec<LabeledConcurrentStatement>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 4.7 Package declarations
@@ -1167,14 +1240,16 @@ pub struct PackageDeclaration {
     pub ident: WithDecl<Ident>,
     pub generic_clause: Option<Vec<InterfaceDeclaration>>,
     pub decl: Vec<Declaration>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 4.8 Package bodies
 #[derive(PartialEq, Debug, Clone)]
 pub struct PackageBody {
     pub context_clause: ContextClause,
-    pub ident: WithRef<Ident>,
+    pub ident: WithDecl<Ident>,
     pub decl: Vec<Declaration>,
+    pub end_ident_pos: Option<SrcPos>,
 }
 
 /// LRM 13.1 Design units

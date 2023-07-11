@@ -6,27 +6,34 @@
 
 #[macro_use]
 mod analyze;
+mod assignment;
 mod association;
 mod concurrent;
 mod declarative;
 mod design_unit;
+mod expression;
 mod formal_region;
-mod implicits;
 mod literals;
 mod lock;
 mod named_entity;
 mod names;
 mod overloaded;
+mod package_instance;
+mod range;
 mod region;
 mod root;
 mod semantic;
 mod sequential;
 mod standard;
+mod static_expression;
 mod target;
 mod visibility;
 
 #[cfg(test)]
 mod tests;
 
-pub use self::root::DesignRoot;
-pub use named_entity::{HasNamedEntity, NamedEntity, NamedEntityKind};
+pub use self::root::{DesignRoot, EntHierarchy};
+pub use named_entity::{
+    AnyEnt, AnyEntKind, Concurrent, Design, EntRef, EntityId, HasEntityId, Object, Overloaded,
+    Related, Sequential, Type,
+};

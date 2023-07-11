@@ -65,6 +65,18 @@ impl Diagnostic {
         diagnostic
     }
 
+    pub fn opt_related(
+        self,
+        item: Option<impl AsRef<SrcPos>>,
+        message: impl Into<String>,
+    ) -> Diagnostic {
+        let mut diagnostic = self;
+        if let Some(item) = item {
+            diagnostic.add_related(item, message);
+        }
+        diagnostic
+    }
+
     pub fn add_related(&mut self, item: impl AsRef<SrcPos>, message: impl Into<String>) {
         self.related
             .push((item.as_ref().to_owned(), message.into()));
@@ -76,7 +88,7 @@ impl Diagnostic {
         for (pos, msg) in related {
             diagnostics.push(Diagnostic::new(
                 pos,
-                format!("related: {}", msg),
+                format!("related: {msg}"),
                 Severity::Hint,
             ));
         }
@@ -86,7 +98,7 @@ impl Diagnostic {
     pub fn show(&self) -> String {
         let mut result = String::new();
         for (pos, message) in self.related.iter() {
-            result.push_str(&pos.show(&format!("related: {}", message)));
+            result.push_str(&pos.show(&format!("related: {message}")));
             result.push('\n');
         }
         let severity = match self.severity {
@@ -152,6 +164,16 @@ pub struct NullDiagnostics;
 impl DiagnosticHandler for NullDiagnostics {
     fn push(&mut self, _diagnostic: Diagnostic) {
         // Ignore
+    }
+}
+
+#[cfg(test)]
+pub struct NoDiagnostics;
+
+#[cfg(test)]
+impl DiagnosticHandler for NoDiagnostics {
+    fn push(&mut self, diagnostic: crate::Diagnostic) {
+        panic!("{}", diagnostic.show())
     }
 }
 

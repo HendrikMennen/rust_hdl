@@ -4,7 +4,9 @@
 //
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
-use crate::ast::{self, Operator};
+use fnv::FnvHashMap;
+
+use crate::ast::{self, AttributeDesignator, Operator};
 use crate::ast::{BaseSpecifier, Ident};
 use crate::data::*;
 
@@ -165,12 +167,13 @@ pub enum Kind {
 }
 use self::Kind::*;
 
-/// Expect any number of token kind patterns, returns Ok variant when
-/// match else Err variant
+/// Expect any number of token kind patterns, return on no match with
+/// error diagnostic based on expected kinds
 #[macro_export]
-macro_rules! match_token_kind {
-    ($token:expr, $($($kind:ident)|+ => $result:expr),*) => {
+macro_rules! peek_token {
+    ($tokens:expr, $token:ident, $($($kind:ident)|+ => $result:expr),*) => {
         {
+            let $token = $tokens.peek_expect()?;
             match $token.kind {
                 $(
                     $($kind)|+ => $result
@@ -184,7 +187,7 @@ macro_rules! match_token_kind {
                         )*
                     ];
 
-                    Err($token.kinds_error(&kinds))
+                    return Err($crate::syntax::tokens::kinds_error($tokens.pos_before($token), &kinds));
                 }
             }
         }
@@ -193,8 +196,50 @@ macro_rules! match_token_kind {
 
 /// Expect any number of token kind patterns, return on no match with
 /// error diagnostic based on expected kinds
+///
+/// Note: never consumes a token it does not expect
 #[macro_export]
-macro_rules! try_token_kind {
+macro_rules! expect_token {
+    ($tokens:expr, $token:ident, $($($kind:ident)|+ => $result:expr),*) => {
+        {
+            let $token = $tokens.peek_expect()?;
+            match $token.kind {
+                $(
+                    $($kind)|+ => {
+                        $tokens.skip();
+                        $result
+                    }
+                ),*,
+                _ => {
+                    let kinds = vec![
+                        $(
+                            $(
+                                $kind,
+                            )*
+                        )*
+                    ];
+
+                    return Err($crate::syntax::tokens::kinds_error($tokens.pos_before($token), &kinds));
+                }
+            }
+        }
+    }
+}
+
+/// Expect any number of token kind patterns, return on no match with
+/// error diagnostic based on expected kinds
+///
+/// Unlike the try_token_kind this macro gives errors always on the next token
+/// Example:
+///
+/// entity ent is
+/// end entity;
+///            ~ <- error should not be here
+///
+/// foo
+/// ~~~ <- error should be here
+#[macro_export]
+macro_rules! try_init_token_kind {
     ($token:expr, $($($kind:ident)|+ => $result:expr),*) => {
         match $token.kind {
             $(
@@ -406,7 +451,6 @@ pub struct Token {
     pub kind: Kind,
     pub value: Value,
     pub pos: SrcPos,
-    pub next_state: ReaderState,
     pub comments: Option<Box<TokenComments>>,
 }
 
@@ -445,10 +489,10 @@ pub fn kinds_error<T: AsRef<SrcPos>>(pos: T, kinds: &[Kind]) -> Diagnostic {
 
 impl Token {
     pub fn kinds_error(&self, kinds: &[Kind]) -> Diagnostic {
-        kinds_error(self, kinds)
+        kinds_error(&self.pos, kinds)
     }
 
-    pub fn expect_ident(self) -> DiagnosticResult<Ident> {
+    pub fn to_identifier_value(&self) -> DiagnosticResult<Ident> {
         if let Token {
             kind: Identifier,
             value: Value::Identifier(value),
@@ -456,13 +500,13 @@ impl Token {
             ..
         } = self
         {
-            Ok(WithPos::from(value, pos))
+            Ok(WithPos::from(value.clone(), pos.clone()))
         } else {
             Err(self.kinds_error(&[Identifier]))
         }
     }
 
-    pub fn expect_character(self) -> DiagnosticResult<WithPos<u8>> {
+    pub fn to_character_value(&self) -> DiagnosticResult<WithPos<u8>> {
         if let Token {
             kind: Character,
             value: Value::Character(value),
@@ -470,21 +514,13 @@ impl Token {
             ..
         } = self
         {
-            Ok(WithPos::from(value, pos))
+            Ok(WithPos::from(*value, pos.clone()))
         } else {
             Err(self.kinds_error(&[Character]))
         }
     }
 
-    pub fn expect_kind(self, kind: Kind) -> DiagnosticResult<Token> {
-        if self.kind == kind {
-            Ok(self)
-        } else {
-            Err(self.kinds_error(&[kind]))
-        }
-    }
-
-    pub fn expect_bit_string(self) -> DiagnosticResult<WithPos<ast::BitString>> {
+    pub fn to_bit_string(&self) -> DiagnosticResult<WithPos<ast::BitString>> {
         if let Token {
             kind: BitString,
             value: Value::BitString(value),
@@ -492,13 +528,13 @@ impl Token {
             ..
         } = self
         {
-            Ok(WithPos::from(value, pos))
+            Ok(WithPos::from(value.clone(), pos.clone()))
         } else {
             Err(self.kinds_error(&[BitString]))
         }
     }
 
-    pub fn expect_abstract_literal(self) -> DiagnosticResult<WithPos<ast::AbstractLiteral>> {
+    pub fn to_abstract_literal(&self) -> DiagnosticResult<WithPos<ast::AbstractLiteral>> {
         if let Token {
             kind: AbstractLiteral,
             value: Value::AbstractLiteral(value),
@@ -506,13 +542,13 @@ impl Token {
             ..
         } = self
         {
-            Ok(WithPos::from(value, pos))
+            Ok(WithPos::from(*value, pos.clone()))
         } else {
             Err(self.kinds_error(&[AbstractLiteral]))
         }
     }
 
-    pub fn expect_string(self) -> DiagnosticResult<WithPos<Latin1String>> {
+    pub fn to_string_value(&self) -> DiagnosticResult<WithPos<Latin1String>> {
         if let Token {
             kind: StringLiteral,
             value: Value::String(value),
@@ -520,14 +556,14 @@ impl Token {
             ..
         } = self
         {
-            Ok(WithPos::from(value, pos))
+            Ok(WithPos::from(value.clone(), pos.clone()))
         } else {
             Err(self.kinds_error(&[StringLiteral]))
         }
     }
 
-    pub fn expect_operator_symbol(self) -> DiagnosticResult<WithPos<Operator>> {
-        let string = self.expect_string()?;
+    pub fn to_operator_symbol(&self) -> DiagnosticResult<WithPos<Operator>> {
+        let string = self.to_string_value()?;
         if let Some(op) = Operator::from_latin1(string.item) {
             Ok(WithPos::new(op, string.pos))
         } else {
@@ -736,12 +772,6 @@ impl TokenState {
             last_token_kind: None,
             start,
         }
-    }
-
-    /// Set state to after token
-    pub fn set_after(&mut self, token: &Token) {
-        self.last_token_kind = Some(token.kind);
-        self.start = token.next_state;
     }
 }
 
@@ -975,7 +1005,7 @@ fn parse_abstract_literal(
                     Err(TokenError::range(
                         state.pos(),
                         pos_after_initial,
-                        format!("Base must be at least 2 and at most 16, got {}", base),
+                        format!("Base must be at least 2 and at most 16, got {base}"),
                     ))
                 }
             } else {
@@ -1189,8 +1219,8 @@ fn skip_whitespace(reader: &mut ContentReader) {
 
 fn get_trailing_comment(reader: &mut ContentReader) -> Result<Option<Comment>, TokenError> {
     skip_whitespace_in_line(reader);
-
     let state = reader.state();
+
     match reader.pop()? {
         Some(b'-') => {
             if reader.pop()? == Some(b'-') {
@@ -1211,6 +1241,7 @@ fn get_trailing_comment(reader: &mut ContentReader) -> Result<Option<Comment>, T
 pub struct Symbols {
     symtab: SymbolTable,
     keywords: Vec<Kind>,
+    attributes: FnvHashMap<Symbol, AttributeDesignator>,
 }
 
 impl Symbols {
@@ -1330,6 +1361,79 @@ impl std::default::Default for Symbols {
             ("vunit", Vunit),
         ];
 
+        let attributes = [
+            (
+                "reverse_range",
+                AttributeDesignator::Range(ast::RangeAttribute::ReverseRange),
+            ),
+            (
+                "element",
+                AttributeDesignator::Type(ast::TypeAttribute::Element),
+            ),
+            ("ascending", AttributeDesignator::Ascending),
+            ("descending", AttributeDesignator::Descending),
+            ("high", AttributeDesignator::High),
+            ("low", AttributeDesignator::Low),
+            ("left", AttributeDesignator::Left),
+            ("right", AttributeDesignator::Right),
+            ("length", AttributeDesignator::Length),
+            ("image", AttributeDesignator::Image),
+            ("value", AttributeDesignator::Value),
+            ("pos", AttributeDesignator::Pos),
+            ("val", AttributeDesignator::Val),
+            ("succ", AttributeDesignator::Succ),
+            ("pred", AttributeDesignator::Pred),
+            ("leftof", AttributeDesignator::LeftOf),
+            ("rightof", AttributeDesignator::RightOf),
+            (
+                "delayed",
+                AttributeDesignator::Signal(ast::SignalAttribute::Delayed),
+            ),
+            (
+                "active",
+                AttributeDesignator::Signal(ast::SignalAttribute::Active),
+            ),
+            (
+                "event",
+                AttributeDesignator::Signal(ast::SignalAttribute::Event),
+            ),
+            (
+                "quiet",
+                AttributeDesignator::Signal(ast::SignalAttribute::Quiet),
+            ),
+            (
+                "stable",
+                AttributeDesignator::Signal(ast::SignalAttribute::Stable),
+            ),
+            (
+                "transaction",
+                AttributeDesignator::Signal(ast::SignalAttribute::Transaction),
+            ),
+            (
+                "last_event",
+                AttributeDesignator::Signal(ast::SignalAttribute::LastEvent),
+            ),
+            (
+                "last_active",
+                AttributeDesignator::Signal(ast::SignalAttribute::LastActive),
+            ),
+            (
+                "last_value",
+                AttributeDesignator::Signal(ast::SignalAttribute::LastValue),
+            ),
+            (
+                "driving",
+                AttributeDesignator::Signal(ast::SignalAttribute::Driving),
+            ),
+            (
+                "driving_value",
+                AttributeDesignator::Signal(ast::SignalAttribute::DrivingValue),
+            ),
+            ("simple_name", AttributeDesignator::SimpleName),
+            ("instance_name", AttributeDesignator::InstanceName),
+            ("path_name", AttributeDesignator::PathName),
+        ];
+
         let symtab = SymbolTable::default();
         let mut keywords = Vec::with_capacity(keywords_init.len());
 
@@ -1342,7 +1446,16 @@ impl std::default::Default for Symbols {
             keywords.push(*kind);
         }
 
-        Symbols { symtab, keywords }
+        let attributes = attributes
+            .into_iter()
+            .map(|(name, des)| (symtab.insert_utf8(name), des))
+            .collect();
+
+        Symbols {
+            symtab,
+            keywords,
+            attributes,
+        }
     }
 }
 
@@ -1350,12 +1463,9 @@ pub struct Tokenizer<'a> {
     symbols: &'a Symbols,
     buffer: Latin1String,
     state: TokenState,
-    source: &'a Source,
+    pub source: &'a Source,
     reader: ContentReader<'a>,
     final_comments: Option<Vec<Comment>>,
-    range_sym: Symbol,
-    subtype_sym: Symbol,
-    reverse_range_sym: Symbol,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -1364,12 +1474,6 @@ impl<'a> Tokenizer<'a> {
         source: &'a Source,
         reader: ContentReader<'a>,
     ) -> Tokenizer<'a> {
-        let subtype_sym = symbols.symtab().insert(&Latin1String::new(b"subtype"));
-        let range_sym = symbols.symtab().insert(&Latin1String::new(b"range"));
-        let reverse_range_sym = symbols
-            .symtab()
-            .insert(&Latin1String::new(b"reverse_range"));
-
         Tokenizer {
             symbols,
             state: TokenState::new(reader.state()),
@@ -1377,44 +1481,15 @@ impl<'a> Tokenizer<'a> {
             source,
             reader,
             final_comments: None,
-            subtype_sym,
-            range_sym,
-            reverse_range_sym,
         }
     }
 
-    pub fn state(&self) -> TokenState {
-        self.state
-    }
-
-    pub fn eof_error(&self) -> Diagnostic {
-        Diagnostic::error(
-            self.source
-                .pos(self.state.start.pos(), self.state.start.pos().next_char()),
-            "Unexpected EOF",
-        )
-    }
-
-    pub fn set_state(&mut self, state: TokenState) {
-        self.state = state;
-        self.reader.set_state(state.start);
-    }
-
-    pub fn move_after(&mut self, token: &Token) {
-        self.state.set_after(token);
-        self.reader.set_state(self.state.start);
-    }
-
-    pub fn subtype_sym(&self) -> &Symbol {
-        &self.subtype_sym
-    }
-
-    pub fn range_sym(&self) -> &Symbol {
-        &self.range_sym
-    }
-
-    pub fn reverse_range_sym(&self) -> &Symbol {
-        &self.reverse_range_sym
+    pub fn attribute(&self, sym: Symbol) -> AttributeDesignator {
+        self.symbols
+            .attributes
+            .get(&sym)
+            .cloned()
+            .unwrap_or_else(|| AttributeDesignator::Ident(sym))
     }
 
     fn parse_token(&mut self) -> Result<Option<(Kind, Value)>, TokenError> {
@@ -1659,10 +1734,9 @@ impl<'a> Tokenizer<'a> {
                     kind,
                     value,
                     pos: self.source.pos(pos_start, pos_end),
-                    next_state: self.reader.state(),
                     comments: token_comments,
                 };
-                self.move_after(&token);
+                self.state.last_token_kind = Some(token.kind);
                 Ok(Some(token))
             }
             None => {
@@ -1697,13 +1771,6 @@ mod tests {
     use super::*;
     use crate::syntax::test::Code;
     use pretty_assertions::assert_eq;
-
-    fn state_at_end(code: &Code) -> ReaderState {
-        let contents = code.source().contents();
-        let mut reader = ContentReader::new(&contents);
-        reader.seek_pos(code.end());
-        reader.state()
-    }
 
     fn kinds(tokens: &[Token]) -> Vec<Kind> {
         tokens.iter().map(|tok| tok.kind).collect()
@@ -1760,7 +1827,6 @@ end entity"
                 kind: Entity,
                 value: Value::NoValue,
                 pos: code.s1("entity").pos(),
-                next_state: state_at_end(&code.s1("entity ")),
                 comments: None,
             }
         );
@@ -1771,7 +1837,6 @@ end entity"
                 kind: Identifier,
                 value: Value::Identifier(code.symbol("foo")),
                 pos: code.s1("foo").pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             }
         );
@@ -1795,7 +1860,6 @@ end entity"
                 kind: Identifier,
                 value: Value::Identifier(code.symbol("my_ident")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             }]
         );
@@ -1812,7 +1876,6 @@ end entity"
                 kind: Identifier,
                 value: Value::Identifier(code.symbol("my_ident")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             }]
         );
@@ -1829,7 +1892,6 @@ end entity"
                 kind: Identifier,
                 value: Value::Identifier(code.symbol("\\1$my_ident\\")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             }]
         );
@@ -1841,7 +1903,6 @@ end entity"
                 kind: Identifier,
                 value: Value::Identifier(code.symbol("\\my\\_ident\\")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             }]
         );
@@ -1849,7 +1910,11 @@ end entity"
 
     #[test]
     fn tokenize_many_identifiers() {
-        let code = Code::new("my_ident my_other_ident");
+        let code = Code::new(
+            "my_ident     
+        
+my_other_ident",
+        );
         let tokens = code.tokenize();
         assert_eq!(
             tokens,
@@ -1858,14 +1923,12 @@ end entity"
                     kind: Identifier,
                     value: Value::Identifier(code.symbol("my_ident")),
                     pos: code.s1("my_ident").pos(),
-                    next_state: state_at_end(&code.s1("my_ident ")),
                     comments: None,
                 },
                 Token {
                     kind: Identifier,
                     value: Value::Identifier(code.symbol("my_other_ident")),
                     pos: code.s1("my_other_ident").pos(),
-                    next_state: state_at_end(&code),
                     comments: None,
                 },
             ]
@@ -2019,7 +2082,6 @@ end entity"
                 kind: StringLiteral,
                 value: Value::String(Latin1String::from_utf8_unchecked("string")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             },]
         );
@@ -2035,7 +2097,6 @@ end entity"
                 kind: StringLiteral,
                 value: Value::String(Latin1String::from_utf8_unchecked("str\"ing")),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             },]
         );
@@ -2052,14 +2113,12 @@ end entity"
                     kind: StringLiteral,
                     value: Value::String(Latin1String::from_utf8_unchecked("str")),
                     pos: code.s1("\"str\"").pos(),
-                    next_state: state_at_end(&code.s1("\"str\" ")),
                     comments: None,
                 },
                 Token {
                     kind: StringLiteral,
                     value: Value::String(Latin1String::from_utf8_unchecked("ing")),
                     pos: code.s1("\"ing\"").pos(),
-                    next_state: state_at_end(&code),
                     comments: None,
                 },
             ]
@@ -2122,7 +2181,7 @@ end entity"
                         ("".to_owned(), None)
                     };
 
-                    let code = format!("{}{}\"{}\"", length_str, base_spec, value);
+                    let code = format!("{length_str}{base_spec}\"{value}\"");
 
                     let code = if upper_case {
                         code.to_ascii_uppercase()
@@ -2148,7 +2207,6 @@ end entity"
                                 value: Latin1String::from_utf8_unchecked(value.as_str())
                             }),
                             pos: code.pos(),
-                            next_state: state_at_end(&code),
                             comments: None,
                         },]
                     );
@@ -2451,7 +2509,7 @@ comment
         );
 
         let exponent_str = ((i32::max_value() as i64) + 1).to_string();
-        let large_int = format!("1e{}", exponent_str);
+        let large_int = format!("1e{exponent_str}");
         let code = Code::new(&large_int);
         let (tokens, _) = code.tokenize_result();
         assert_eq!(
@@ -2463,7 +2521,7 @@ comment
         );
 
         let exponent_str = ((i32::min_value() as i64) - 1).to_string();
-        let large_int = format!("1.0e{}", exponent_str);
+        let large_int = format!("1.0e{exponent_str}");
         let code = Code::new(&large_int);
         let (tokens, _) = code.tokenize_result();
         assert_eq!(
@@ -2494,7 +2552,6 @@ comment
                 kind: AbstractLiteral,
                 value: Value::AbstractLiteral(ast::AbstractLiteral::Integer(u64::max_value())),
                 pos: code.pos(),
-                next_state: state_at_end(&code),
                 comments: None,
             })]
         );
@@ -2511,7 +2568,6 @@ comment
                     kind: Begin,
                     value: Value::NoValue,
                     pos: code.s1("begin").pos(),
-                    next_state: state_at_end(&code.s1("begin")),
                     comments: None,
                 }),
                 Err(Diagnostic::error(&code.s1("!"), "Illegal token")),
@@ -2519,43 +2575,9 @@ comment
                     kind: End,
                     value: Value::NoValue,
                     pos: code.s1("end").pos(),
-                    next_state: state_at_end(&code),
                     comments: None,
                 }),
             ]
-        );
-    }
-
-    #[test]
-    fn test_match_token_kind() {
-        let tokens = Code::new("entity").tokenize();
-        let result = match_token_kind!(
-            tokens[0],
-            Identifier => Ok(1),
-            Entity => Ok(2));
-        assert_eq!(result, Ok(2));
-    }
-
-    #[test]
-    fn test_match_token_kind_error() {
-        let tokens = Code::new("+").tokenize();
-        let result = match_token_kind!(
-            tokens[0],
-            Identifier => Ok(1),
-            Entity => Ok(2));
-        assert_eq!(result, Err(tokens[0].kinds_error(&[Identifier, Entity])));
-    }
-
-    #[test]
-    fn test_match_token_kind_pattern_error() {
-        let tokens = Code::new("+").tokenize();
-        let result = match_token_kind!(
-            tokens[0],
-            Identifier | StringLiteral => Ok(1),
-            Entity => Ok(2));
-        assert_eq!(
-            result,
-            Err(tokens[0].kinds_error(&[Identifier, StringLiteral, Entity]))
         );
     }
 
@@ -2613,7 +2635,6 @@ comment
                     kind: Plus,
                     value: Value::NoValue,
                     pos: code.s1("+").pos(),
-                    next_state: state_at_end(&code.s1("+--this is still a plus")),
                     comments: Some(Box::new(TokenComments {
                         leading: vec![Comment {
                             value: "this is a plus".to_string(),
@@ -2631,7 +2652,6 @@ comment
                     kind: Minus,
                     value: Value::NoValue,
                     pos: minus_pos,
-                    next_state: state_at_end(&code.s1("-- this is a minus")),
                     comments: Some(Box::new(TokenComments {
                         leading: vec![
                             Comment {
@@ -2692,7 +2712,6 @@ bar*/
                 kind: AbstractLiteral,
                 value: Value::AbstractLiteral(ast::AbstractLiteral::Integer(2)),
                 pos: code.s1("2").pos(),
-                next_state: state_at_end(&code.s1("2")),
                 comments: Some(Box::new(TokenComments {
                     leading: vec![Comment {
                         value: "foo\ncom*ment\nbar".to_string(),
@@ -2729,7 +2748,6 @@ entity -- €
                 kind: Entity,
                 value: Value::NoValue,
                 pos: code.s1("entity").pos(),
-                next_state: state_at_end(&code.s1("entity -- €")),
                 comments: Some(Box::new(TokenComments {
                     leading: vec![Comment {
                         value: " € ".to_string(),

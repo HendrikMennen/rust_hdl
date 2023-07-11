@@ -189,13 +189,13 @@ end architecture;
             Diagnostic::error(code.s("theport", 2), "No declaration of 'theport'"),
             Diagnostic::error(
                 code.s1("work.ent_inst"),
-                "No association of interface signal 'theport' : in",
+                "No association of port 'theport' : in",
             )
             .related(code.s1("theport"), "Defined here"),
             Diagnostic::error(code.s("thegeneric", 2), "No declaration of 'thegeneric'"),
             Diagnostic::error(
                 code.s1("work.ent_inst"),
-                "No association of interface constant 'thegeneric'",
+                "No association of generic 'thegeneric'",
             )
             .related(code.s1("thegeneric"), "Defined here"),
         ],
@@ -293,6 +293,44 @@ end architecture;
 }
 
 #[test]
+fn type_conversion_of_port_name() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+entity ent is
+    port (
+        theport: out natural
+    );
+end entity;
+
+architecture a of ent is
+begin
+end architecture;
+
+entity ent2 is
+end entity;
+
+architecture a of ent2 is
+    signal sig : real;
+begin
+    inst: entity work.ent
+        port map (
+        real(theport) => sig);
+end architecture;
+        ",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+
+    assert_eq!(
+        root.search_reference_pos(code.source(), code.s("theport", 2).end()),
+        Some(code.s1("theport").pos())
+    );
+}
+
+#[test]
 fn function_conversion_of_port_name_must_be_single_argument() {
     let mut builder = LibraryBuilder::new();
     let code = builder.code(
@@ -382,7 +420,9 @@ end architecture;
 
 #[test]
 fn output_ports_may_be_left_open() {
-    check_code_with_no_diagnostics(
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
         "
 entity ent2 is
 port (
@@ -407,4 +447,11 @@ begin
 end architecture;
     ",
     );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+    // Still resolves references when missing output port
+    assert!(root
+        .search_reference(code.source(), code.s1("inport => sig").s1("sig").start())
+        .is_some())
 }

@@ -11,13 +11,11 @@ use super::subprogram::parse_signature;
 use super::tokens::{Kind::*, TokenStream};
 use crate::ast::{
     Attribute, AttributeDeclaration, AttributeSpecification, Designator, EntityClass, EntityName,
-    EntityTag,
+    EntityTag, WithRef,
 };
 
-fn parse_entity_class(stream: &mut TokenStream) -> ParseResult<EntityClass> {
-    let token = stream.expect()?;
-    Ok(try_token_kind!(
-        token,
+fn parse_entity_class(stream: &TokenStream) -> ParseResult<EntityClass> {
+    Ok(expect_token!(stream, token,
         Entity => EntityClass::Entity,
         Architecture => EntityClass::Architecture,
         Configuration => EntityClass::Configuration,
@@ -33,21 +31,21 @@ fn parse_entity_class(stream: &mut TokenStream) -> ParseResult<EntityClass> {
     ))
 }
 
-pub fn parse_entity_name_list(stream: &mut TokenStream) -> ParseResult<Vec<EntityName>> {
-    let token = stream.peek_expect()?;
-    Ok(try_token_kind!(
-        token,
+pub fn parse_entity_name_list(stream: &TokenStream) -> ParseResult<Vec<EntityName>> {
+    Ok(expect_token!(stream, token,
         Identifier | StringLiteral => {
             let mut entity_name_list = Vec::new();
+            let mut token = token;
             loop {
-                let designator_token = stream.expect()?;
-                let designator = try_token_kind!(
-                    designator_token,
-                    Identifier => designator_token.expect_ident()?.map_into(Designator::Identifier),
-                    StringLiteral => designator_token.expect_operator_symbol()?.map_into(Designator::OperatorSymbol));
+
+                let designator = match token.kind {
+                    Identifier => token.to_identifier_value()?.map_into(Designator::Identifier),
+                    StringLiteral => token.to_operator_symbol()?.map_into(Designator::OperatorSymbol),
+                    _ => unreachable!(""),
+                };
 
                 let signature = {
-                    if stream.peek_kind()? == Some(LeftSquare) {
+                    if stream.peek_kind() == Some(LeftSquare) {
                         Some(parse_signature(stream)?)
                     } else {
                         None
@@ -55,42 +53,30 @@ pub fn parse_entity_name_list(stream: &mut TokenStream) -> ParseResult<Vec<Entit
                 };
 
                 entity_name_list.push(EntityName::Name(EntityTag {
-                    designator,
+                    designator: designator.map_into(WithRef::new),
                     signature,
                 }));
 
-                let sep_token = stream.peek_expect()?;
-
-                try_token_kind!(
-                    sep_token,
-
-                    Comma => {
-                        stream.move_after(&sep_token);
-                    },
-                    Colon => {
-                        break entity_name_list;
-                    }
-                )
+                if stream.skip_if_kind(Comma) {
+                    token = expect_token!(stream, token, Identifier | StringLiteral => token);
+                } else {
+                    break entity_name_list;
+                }
             }
         },
         Others => {
-            stream.move_after(&token);
             vec![EntityName::Others]
         },
         All => {
-            stream.move_after(&token);
             vec![EntityName::All]
         }
     ))
 }
 
-pub fn parse_attribute(stream: &mut TokenStream) -> ParseResult<Vec<Attribute>> {
+pub fn parse_attribute(stream: &TokenStream) -> ParseResult<Vec<Attribute>> {
     stream.expect_kind(Attribute)?;
     let ident = stream.expect_ident()?;
-    let token = stream.expect()?;
-
-    Ok(try_token_kind!(
-        token,
+    Ok(expect_token!(stream, token,
         Colon => {
             let type_mark = parse_type_mark(stream)?;
             stream.expect_kind(SemiColon)?;
@@ -111,7 +97,7 @@ pub fn parse_attribute(stream: &mut TokenStream) -> ParseResult<Vec<Attribute>> 
                 .into_iter()
                 .map(|entity_name| {
                     Attribute::Specification(AttributeSpecification {
-                        ident: ident.clone().into(),
+                        ident: WithRef::new(ident.clone()),
                         entity_name,
                         entity_class,
                         expr: expr.clone(),
@@ -144,9 +130,9 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_attribute),
             vec![Attribute::Specification(AttributeSpecification {
-                ident: code.s1("attr_name").decl_ident(),
+                ident: WithRef::new(code.s1("attr_name").ident()),
                 entity_name: EntityName::Name(EntityTag {
-                    designator: code.s1("foo").designator(),
+                    designator: code.s1("foo").ref_designator(),
                     signature: None
                 }),
                 entity_class: EntityClass::Signal,
@@ -161,9 +147,9 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_attribute),
             vec![Attribute::Specification(AttributeSpecification {
-                ident: code.s1("attr_name").decl_ident(),
+                ident: WithRef::new(code.s1("attr_name").ident()),
                 entity_name: EntityName::Name(EntityTag {
-                    designator: code.s1("\"**\"").designator(),
+                    designator: code.s1("\"**\"").ref_designator(),
                     signature: None
                 }),
                 entity_class: EntityClass::Function,
@@ -179,18 +165,18 @@ mod tests {
             code.with_stream(parse_attribute),
             vec![
                 Attribute::Specification(AttributeSpecification {
-                    ident: code.s1("attr_name").decl_ident(),
+                    ident: WithRef::new(code.s1("attr_name").ident()),
                     entity_name: EntityName::Name(EntityTag {
-                        designator: code.s1("foo").designator(),
+                        designator: code.s1("foo").ref_designator(),
                         signature: None
                     }),
                     entity_class: EntityClass::Signal,
                     expr: code.s1("0+1").expr()
                 }),
                 Attribute::Specification(AttributeSpecification {
-                    ident: code.s1("attr_name").decl_ident(),
+                    ident: WithRef::new(code.s1("attr_name").ident()),
                     entity_name: EntityName::Name(EntityTag {
-                        designator: code.s1("bar").designator(),
+                        designator: code.s1("bar").ref_designator(),
                         signature: None
                     }),
                     entity_class: EntityClass::Signal,
@@ -206,7 +192,7 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_attribute),
             vec![Attribute::Specification(AttributeSpecification {
-                ident: code.s1("attr_name").decl_ident(),
+                ident: WithRef::new(code.s1("attr_name").ident()),
                 entity_name: EntityName::All,
                 entity_class: EntityClass::Signal,
                 expr: code.s1("0+1").expr()
@@ -220,7 +206,7 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_attribute),
             vec![Attribute::Specification(AttributeSpecification {
-                ident: code.s1("attr_name").decl_ident(),
+                ident: WithRef::new(code.s1("attr_name").ident()),
                 entity_name: EntityName::Others,
                 entity_class: EntityClass::Signal,
                 expr: code.s1("0+1").expr()
@@ -234,9 +220,9 @@ mod tests {
         assert_eq!(
             code.with_stream(parse_attribute),
             vec![Attribute::Specification(AttributeSpecification {
-                ident: code.s1("attr_name").decl_ident(),
+                ident: WithRef::new(code.s1("attr_name").ident()),
                 entity_name: EntityName::Name(EntityTag {
-                    designator: code.s1("foo").designator(),
+                    designator: code.s1("foo").ref_designator(),
                     signature: Some(code.s1("[return natural]").signature())
                 }),
                 entity_class: EntityClass::Function,

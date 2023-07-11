@@ -23,11 +23,10 @@ signal bad : natural := subpgm;
     let diagnostics = builder.analyze();
     check_diagnostics(
         diagnostics,
-        vec![Diagnostic::error(
-            code.s1("subpgm;").s1("subpgm"),
-            "No association of interface constant 'arg'",
-        )
-        .related(code.s1("arg"), "Defined here")],
+        vec![
+            Diagnostic::error(code.s1("subpgm;").s1("subpgm"), "Invalid call to 'subpgm'")
+                .related(code.s1("subpgm"), "Missing association of parameter 'arg'"),
+        ],
     );
 }
 
@@ -65,10 +64,12 @@ end architecture;
         vec![
             Diagnostic::error(code.s("subpgm", 2), "Invalid procedure call").related(
                 code.s("subpgm", 1),
-                "subpgm[NATURAL return NATURAL] is not a procedure",
+                "function subpgm[NATURAL return NATURAL] is not a procedure",
             ),
-            Diagnostic::error(code.s("thesig", 2), "Invalid procedure call")
-                .related(code.s("thesig", 1), "signal 'thesig' is not a procedure"),
+            Diagnostic::error(
+                code.s("thesig", 2),
+                "signal 'thesig' of array type 'INTEGER_VECTOR' is not a procedure",
+            ),
         ],
     );
 }
@@ -122,8 +123,8 @@ constant bad : integer := subpgm(arg2 => 1);
         vec![
             Diagnostic::error(code.s1("arg2"), "No declaration of 'arg2'"),
             Diagnostic::error(
-                code.s1("subpgm(arg2").s1("subpgm"),
-                "No association of interface constant 'arg1'",
+                code.s1("subpgm(arg2 => 1)"),
+                "No association of parameter 'arg1'",
             )
             .related(code.s1("arg1"), "Defined here"),
         ],
@@ -182,11 +183,10 @@ signal bad : natural := subpgm(0);
     let (root, diagnostics) = builder.get_analyzed_root();
     check_diagnostics(
         diagnostics,
-        vec![Diagnostic::error(
-            code.s1("subpgm(0)").s1("subpgm"),
-            "No association of interface constant 'arg2'",
-        )
-        .related(code.s1("arg2"), "Defined here")],
+        vec![
+            Diagnostic::error(code.s1("subpgm(0)"), "No association of parameter 'arg2'")
+                .related(code.s1("arg2"), "Defined here"),
+        ],
     );
 
     assert_eq!(

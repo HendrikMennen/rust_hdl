@@ -5,6 +5,7 @@
 // Copyright (c) 2019, Olof Kraigher olof.kraigher@gmail.com
 
 use super::*;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn resolves_names_in_object_decl_init_expressions() {
@@ -187,9 +188,11 @@ fn resolves_names_in_discrete_ranges() {
     check_missing(
         "
 package pkg is
-  type arr_t is array (natural range missing to missing) of natural;
-  type arr2_t is array (missing to missing) of natural;
-  type arr3_t is array (missing'range) of natural;
+  type arr0_t is array (natural range missing to 0) of natural;
+  type arr1_t is array (natural range 0 to missing) of natural;
+  type arr2_t is array (missing to 0) of natural;
+  type arr3_t is array (0 to missing) of natural;
+  type arr4_t is array (missing'range) of natural;
 end package;
 ",
     );
@@ -200,9 +203,9 @@ fn search_names_in_discrete_ranges() {
     check_search_reference(
         "
 package pkg is
-  constant decl : natural := 0;
-  type arr_t is array (natural range decl to decl) of natural;
-  type arr2_t is array (decl to decl) of natural;
+  constant decl : integer_vector(0 to 1) := (others => 0);
+  type arr_t is array (natural range decl(0) to decl(0)) of natural;
+  type arr2_t is array (decl(0) to decl(0)) of natural;
   type arr3_t is array (decl'range) of natural;
 end package;
 ",
@@ -211,21 +214,20 @@ end package;
 
 #[test]
 fn resolves_names_in_subtype_constraints() {
-    // @TODO check for missing fields in record element constraints
     check_missing(
         "
 package pkg is
-  subtype sub1_t is integer_vector(missing to missing);
-  subtype sub2_t is integer range missing to missing;
+  subtype sub1_t is integer_vector(missing to 0);
+  subtype sub2_t is integer range 0 to missing;
 
   type rec_t is record
     field : integer_vector;
   end record;
 
-  subtype sub3_t is rec_t(field(missing to missing));
+  subtype sub3_t is rec_t(field(missing to 0));
 
   type uarr_t is array (natural range <>) of integer_vector;
-  subtype sub4_t is uarr_t(open)(missing to missing);
+  subtype sub4_t is uarr_t(0 to missing);
 
 end package;
 ",
@@ -248,7 +250,7 @@ package pkg is
   subtype sub3_t is rec_t(field(decl to decl));
 
   type uarr_t is array (natural range <>) of integer_vector;
-  subtype sub4_t is uarr_t(open)(decl to decl);
+  subtype sub4_t is uarr_t(decl to decl);
 
 end package;
 ",
@@ -292,7 +294,7 @@ end package;
 }
 
 #[test]
-fn resolves_names_in_inside_names() {
+fn resolves_names_inside_names() {
     check_missing(
         "
 package pkg is
@@ -318,7 +320,7 @@ package body pkg is
 
      -- Slice
      constant vec : integer_vector(0 to 1) := (0, 1);
-     constant c4 : integer_vector(0 to 1) := vec(missing to missing);
+     constant c4 : integer_vector(0 to 1) := vec(missing to 0);
 
      constant c5 : natural := missing'val(0);
      constant c6 : boolean := boolean'val(missing);
@@ -377,7 +379,7 @@ fn resolves_names_in_aggregates() {
 package pkg is
   -- Named
   constant c0 : integer_vector(0 to 0) := (0 => missing);
-  constant c1 : integer_vector(0 to 0) := (missing to missing => 0);
+  constant c1 : integer_vector(0 to 0) := (missing to 0 => 0);
 
   -- Positional
   constant c2 : integer_vector(0 to 1) := (missing, missing);
@@ -442,7 +444,7 @@ package body pkg is
        -- Qualified
        variable ptr0 : acc_t := new integer_vector'(missing, missing);
        -- Subtype
-       variable ptr1 : acc_t := new integer_vector(missing to missing);
+       variable ptr1 : acc_t := new integer_vector(0 to missing);
     begin
     end procedure;
 end package body;
@@ -482,7 +484,7 @@ end package;
 package body pkg is
     procedure proc2(c : natural) is
     begin
-      return c;
+      return;
     end;
 
     function f return natural is
@@ -508,10 +510,17 @@ package body pkg is
        end if;
 
        -- Loops
-       for i in missing to missing loop
+       for i in missing to 0 loop
+         for j in 0 to missing loop
+         end loop;
+
          proc2(i); -- Index is defined
          missing;
+
+         exit missing;
+         next missing;
        end loop;
+       
 
        loop
          missing;
@@ -527,7 +536,9 @@ package body pkg is
        case missing is
          when missing =>
            missing;
-         when missing to missing =>
+         when 0 to missing =>
+           missing;
+         when missing to 0 =>
            missing;
        end case;
 
@@ -673,7 +684,7 @@ architecture a of ent is
 begin
   main : process is
   begin
-   (0 => decl) := (0 => decl);
+   (0 => decl) := (0 => 1);
   end process;
 end architecture;
 ",
@@ -901,7 +912,7 @@ end entity;
 architecture a of ent is
   constant decl : natural := 0;
 begin
- gen: for i in decl to decl+3 generate
+ gen: for i in decl to decl + 3 generate
  end generate;
 end architecture;
 ",
@@ -1553,7 +1564,7 @@ constant bad : rec_t := (missing => 0);
         .unwrap();
     assert_eq!(field.decl_pos().unwrap(), code.s1("field").pos().as_ref());
     assert_eq!(
-        root.find_all_references(field.clone()),
+        root.find_all_references(field),
         vec![code.s("field", 1).pos(), code.s("field", 2).pos(),]
     );
 
@@ -1605,4 +1616,420 @@ constant good1 : integer := i0 + i0;
     assert_eq!(minus.decl_pos(), integer.decl_pos());
 
     check_no_diagnostics(&diagnostics);
+}
+
+#[test]
+fn attribute_happy_path() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.in_declarative_region(
+        "
+constant c0 : string := \"block\";
+attribute ram_style : string;
+signal ram : integer_vector(0 to 15);
+
+attribute ram_style of ram : signal is c0;
+        ",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+
+    {
+        // References in the expression
+        let ref_pos = code.s1("signal is c0;").s1("c0");
+        let decl = root
+            .search_reference(code.source(), ref_pos.start())
+            .unwrap();
+        assert_eq!(code.s1("c0").pos(), decl.decl_pos().cloned().unwrap());
+    }
+    {
+        // References to the attribute itself
+        let ref_pos = code.s1("attribute ram_style of").s1("ram_style");
+        let decl = root
+            .search_reference(code.source(), ref_pos.start())
+            .unwrap();
+        assert_eq!(
+            code.s1("attribute ram_style").s1("ram_style").pos(),
+            decl.decl_pos().cloned().unwrap()
+        );
+    }
+
+    {
+        // References to the named entity
+        let ref_pos = code.s1("of ram").s1("ram");
+        let decl = root
+            .search_reference(code.source(), ref_pos.start())
+            .unwrap();
+        assert_eq!(
+            code.s1("signal ram").s1("ram").pos(),
+            decl.decl_pos().cloned().unwrap()
+        );
+    }
+}
+
+#[test]
+fn attribute_missing_names() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.in_declarative_region(
+        "
+constant c0 : string := \"block\";
+attribute ram_style : string;
+signal ram : integer_vector(0 to 15);
+
+attribute missing1 of ram : signal is c0;
+attribute ram_style of missing2 : signal is c0;
+attribute ram_style of ram : signal is missing3;
+        ",
+    );
+
+    let diagnostics = builder.analyze();
+    check_diagnostics(
+        diagnostics,
+        vec![
+            Diagnostic::error(code.s1("missing1"), "No declaration of 'missing1'"),
+            Diagnostic::error(code.s1("missing2"), "No declaration of 'missing2'"),
+            Diagnostic::error(code.s1("missing3"), "No declaration of 'missing3'"),
+        ],
+    );
+}
+
+#[test]
+fn attribute_spec_with_non_attribute() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.in_declarative_region(
+        "
+constant bad : natural := 0;
+signal ram : integer_vector(0 to 15);
+attribute bad of ram : signal is 0;
+        ",
+    );
+
+    let diagnostics = builder.analyze();
+    check_diagnostics(
+        diagnostics,
+        vec![Diagnostic::error(
+            code.s1("attribute bad").s1("bad"),
+            "constant 'bad' is not an attribute",
+        )],
+    );
+}
+
+#[test]
+fn selected_function_is_resolved() {
+    // This test case exists because a bug was found
+    // where a the arguments of a selected name prefix
+    // were not resolved because the 'myfun' name already had a referenc set
+    // which cause the disambiguation not to run
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+package pkg is
+   function myfun(arg : integer) return boolean;
+end package;
+
+entity ent is
+end entity;
+
+architecture a of ent is
+   constant c0 : integer := 0;
+   constant c1 : boolean := work.pkg.myfun(c0);
+begin
+end architecture;
+        ",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+
+    assert!(root
+        .search_reference(code.source(), code.s1("myfun(c0)").s1("c0").start())
+        .is_some());
+}
+
+#[test]
+fn subpgm_references_includes_both_definition_and_declaration() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+  package pkg is
+    function myfun(arg : integer) return integer;
+end package;
+
+package body pkg is
+    function myfun(arg : integer) return integer is
+    begin
+        return 0;
+    end;
+end package body;
+
+entity ent is
+    
+end entity;
+
+architecture a of ent is
+    constant c0 : natural := work.pkg.myfun(0);
+begin
+end;
+",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+
+    let decl = root
+        .search_reference(code.source(), code.sa("work.pkg.", "myfun").start())
+        .unwrap();
+
+    assert_eq!(
+        root.find_all_references(decl),
+        vec![
+            code.s("myfun", 1).pos(),
+            code.s("myfun", 2).pos(),
+            code.s("myfun", 3).pos()
+        ]
+    );
+
+    assert_eq!(
+        root.find_definition_of(
+            root.search_reference(code.source(), code.s1("myfun").start())
+                .unwrap()
+        )
+        .unwrap()
+        .decl_pos(),
+        Some(&code.s("myfun", 2).pos())
+    );
+}
+
+#[test]
+fn find_all_references_of_deferred_constant() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+package pkg is
+    constant c0 : natural;
+end package;
+
+
+package body pkg is
+  constant c0 : natural := 0;
+end package body;
+      ",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_no_diagnostics(&diagnostics);
+
+    let references = vec![code.s("c0", 1).pos(), code.s("c0", 2).pos()];
+
+    assert_eq_unordered(
+        &root.find_all_references_pos(&code.s("c0", 1).pos()),
+        &references,
+    );
+
+    assert_eq_unordered(
+        &root.find_all_references_pos(&code.s("c0", 2).pos()),
+        &references,
+    );
+
+    assert_eq!(
+        root.find_definition_of(
+            root.search_reference(code.source(), code.s1("c0").start())
+                .unwrap()
+        )
+        .unwrap()
+        .decl_pos(),
+        Some(&code.s("c0", 2).pos())
+    );
+}
+
+#[test]
+fn find_architecture_references() {
+    let mut builder = LibraryBuilder::new();
+    let code = builder.code(
+        "libname",
+        "
+entity ent1 is
+end entity;
+
+architecture a1 of ent1 is
+begin
+end architecture;
+
+architecture a2 of ent1 is
+begin
+end architecture;
+
+entity ent2 is
+end entity;
+
+architecture a of ent2 is
+begin
+    good_inst1 : entity work.ent1(a1);
+    good_inst2 : entity work.ent1(a2);
+    bad_inst : entity work.ent1(a3);
+end architecture;
+      ",
+    );
+
+    let (root, diagnostics) = builder.get_analyzed_root();
+    check_diagnostics(
+        diagnostics,
+        vec![Diagnostic::error(
+            code.sa("work.ent1(", "a3"),
+            "No architecture 'a3' for entity 'libname.ent1'",
+        )],
+    );
+
+    assert_eq_unordered(
+        &root.find_all_references_pos(&code.s("a1", 1).pos()),
+        &[code.s("a1", 1).pos(), code.s("a1", 2).pos()],
+    );
+
+    assert_eq_unordered(
+        &root.find_all_references_pos(&code.s("a1", 2).pos()),
+        &[code.s("a1", 1).pos(), code.s("a1", 2).pos()],
+    );
+
+    assert_eq!(
+        root.find_definition_of(
+            root.search_reference(code.source(), code.s("a2", 2).start())
+                .unwrap()
+        )
+        .unwrap()
+        .decl_pos(),
+        Some(&code.s("a2", 1).pos())
+    );
+}
+
+#[test]
+fn find_end_identifier_references_of_declarations() {
+    for name in [
+        "ent1", "a1", "rec_t", "prot_t", "phys_t", "fun1", "proc1", "comp1", "pkg", "cfg1", "ctx1",
+    ] {
+        check_search_reference_with_name(
+            name,
+            "
+entity ent1 is
+end entity ent1;
+
+architecture a1 of ent1 is
+
+    type rec_t is record
+       field: natural;
+    end record rec_t;
+
+    type prot_t is protected
+    end protected prot_t;
+
+    type prot_t is protected body
+    end protected body prot_t;
+
+    type phys_t is range 0 to 10
+    units
+       bangs;
+       bugs = 10 bangs;
+    end units phys_t;
+
+    function fun1 return integer is
+    begin
+    end function fun1;
+
+    procedure proc1 is
+    begin
+    end procedure proc1;
+
+    component comp1 is
+    end component comp1;
+begin
+end architecture a1;
+
+package pkg is
+end package pkg;
+
+package body pkg is
+end package body pkg;
+
+configuration cfg1 of ent1 is
+  for rtl(0)
+  end for;
+end configuration cfg1;
+
+context ctx1 is
+end context ctx1;
+      ",
+        );
+    }
+}
+
+#[test]
+fn find_end_identifier_references_of_concurrent() {
+    for name in ["b1", "p1", "fg1", "ig1", "ialt1", "cg1", "cgalt1"] {
+        check_search_reference_with_name(
+            name,
+            "
+entity ent1 is
+end entity ent1;
+
+architecture a1 of ent1 is
+begin
+  b1: block
+  begin
+  end block b1;
+
+  p1: process
+  begin
+  end process p1;
+
+  fg1: for i in 0 to 10 generate
+  end generate fg1;
+
+  ig1: if true generate
+  else ialt1: generate
+  end ialt1;
+  end generate ig1;
+
+  cg1: case 0 generate
+    when cgalt1: 0 => 
+      assert false;
+    end cgalt1;
+  end generate cg1;
+
+end architecture;
+      ",
+        );
+    }
+}
+
+#[test]
+fn find_end_identifier_references_of_sequential() {
+    for name in ["if0", "loop0", "c0"] {
+        check_search_reference_with_name(
+            name,
+            "
+entity ent1 is
+end entity ent1;
+
+architecture a1 of ent1 is
+begin
+  process
+  begin
+    if0: if true then
+    end if if0;
+
+    loop0: for i in 0 to 1 loop
+      next loop0;
+      exit loop0;
+    end loop loop0;
+
+    c0: case 0 is
+      when others =>
+    end case c0;
+  end process;
+end architecture;
+      ",
+        );
+    }
 }
